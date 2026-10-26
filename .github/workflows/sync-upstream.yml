@@ -1,0 +1,46 @@
+name: Sync upstream main
+
+on:
+  schedule:
+    # Every day at 03:17 UTC (12:17 JST / 11:17 CST).
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'Once-debug/singbox-lite'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out fork with full history
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Fetch and merge upstream main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/0xdabiaoge/singbox-lite.git
+          git fetch --no-tags upstream main
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Already up to date with upstream/main."
+            exit 0
+          fi
+
+          # Merge preserves upstream file additions, edits and deletions,
+          # while retaining this fork's own workflow and any independent files.
+          # An actual merge conflict intentionally stops the job for review.
+          git merge --no-edit upstream/main
+          git push origin HEAD:main
