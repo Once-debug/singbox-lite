@@ -11,6 +11,9 @@ umask 077
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
 SINGBOX_BIN="/usr/local/bin/sing-box"
+RELAY_XRAY_BIN="/usr/local/bin/xray"
+RELAY_XRAY_CONFIG="/usr/local/etc/xray/config.json"
+RELAY_XRAY_PID_FILE="/run/xray/xray.pid"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main"
 
 # [整合方案] 检测父进程导出的工具函数
@@ -44,6 +47,22 @@ if ! declare -f _info >/dev/null; then
     _success() { echo -e "${GREEN}[成功] $1${NC}" >&2; }
     _warn() { echo -e "${YELLOW}[注意] $1${NC}" >&2; }
 fi
+
+# 叶子操作与菜单循环共用一次确认，避免结果被下一轮 clear 立即抹掉。
+_menu_pause() {
+    RELAY_RESULT_ACKNOWLEDGED=true
+    [ -t 0 ] || return 0
+    local unused
+    read -r -p "  按回车返回菜单..." unused
+}
+
+_menu_pause_if_needed() {
+    [ "$RELAY_RESULT_ACKNOWLEDGED" = true ] || _menu_pause
+}
+
+_menu_skip_pause() {
+    RELAY_RESULT_ACKNOWLEDGED=true
+}
 
 # --- 全局变量 ---
 # 工具路径
@@ -314,14 +333,14 @@ _json_config_port_conflict() {
     [ -s "$file" ] || return 1
     jq -e --argjson port "$port" --arg proto "$proto" --arg exclude "$exclude_tag" '
         def uses_tcp:
-            if (.network? == "udp" or .type == "hysteria2" or .type == "tuic") then false else true end;
+            if (.network? == "udp" or .type == "hysteria2" or .type == "tuic" or .protocol == "hysteria") then false else true end;
         def uses_udp:
             if .network? == "tcp" then false
-            elif (.type == "hysteria2" or .type == "tuic" or .type == "shadowsocks" or .type == "socks" or .type == "direct") then true
+            elif (.type == "hysteria2" or .type == "tuic" or .type == "shadowsocks" or .type == "socks" or .type == "direct" or .protocol == "shadowsocks" or .protocol == "socks" or .protocol == "hysteria") then true
             else false end;
         any(.inbounds[]?;
             (.tag // "") != $exclude
-            and (.listen_port? == $port)
+            and ((.listen_port? // .port?) == $port)
             and (if $proto == "tcp" then uses_tcp else uses_udp end)
         )
     ' "$file" >/dev/null 2>&1
@@ -638,10 +657,111 @@ _txn_cleanup() {
                 "$dir/relay" "$dir/relay.absent" \
                 "$dir/links" "$dir/links.absent" \
                 "$dir/clash" "$dir/clash.absent" \
+                "$dir/xray" "$dir/xray.absent" \
                 "$dir/pf" "$dir/pf.absent" 2>/dev/null || true
             rmdir -- "$dir" 2>/dev/null || true
             ;;
     esac
+}
+
+_relay_xray_ready() {
+    if [ ! -x "$RELAY_XRAY_BIN" ] || [ ! -s "$RELAY_XRAY_CONFIG" ] || ! jq empty "$RELAY_XRAY_CONFIG" >/dev/null 2>&1; then
+        _error "Xray 中转入口需要先通过 Xray 管理脚本安装核心并初始化配置。"
+        return 1
+    fi
+    case "$INIT_SYSTEM" in
+        systemd) [ -f /etc/systemd/system/xray.service ] || [ -f /lib/systemd/system/xray.service ] ;;
+        openrc) [ -x /etc/init.d/xray ] ;;
+        direct) : ;;
+        *) return 1 ;;
+    esac || { _error "Xray 服务未由管理脚本安装，请先运行 Xray 管理脚本。"; return 1; }
+    "$RELAY_XRAY_BIN" run -test -config "$RELAY_XRAY_CONFIG" >/dev/null 2>&1 || { _error "现有 Xray 配置校验失败"; return 1; }
+}
+
+_relay_xray_service() {
+    local action="$1" pid
+    case "$INIT_SYSTEM" in
+        systemd)
+            systemctl reset-failed xray >/dev/null 2>&1 || true
+            if [ "$STATE_LOCK_OWNED" = "true" ] && [[ "$STATE_LOCK_FD" =~ ^[0-9]+$ ]]; then
+                systemctl "$action" xray 8>&- 9>&- 219>&- {STATE_LOCK_FD}>&-
+            else
+                systemctl "$action" xray 8>&- 9>&- 219>&-
+            fi ;;
+        openrc)
+            if [ "$STATE_LOCK_OWNED" = "true" ] && [[ "$STATE_LOCK_FD" =~ ^[0-9]+$ ]]; then
+                rc-service xray "$action" 8>&- 9>&- 219>&- {STATE_LOCK_FD}>&-
+            else
+                rc-service xray "$action" 8>&- 9>&- 219>&-
+            fi ;;
+        direct)
+            case "$action" in
+                restart)
+                    if [ -s "$RELAY_XRAY_PID_FILE" ]; then
+                        pid=$(cat "$RELAY_XRAY_PID_FILE" 2>/dev/null)
+                        _is_pid_running_cmd "$pid" "$RELAY_XRAY_BIN" && kill "$pid" 2>/dev/null || true
+                    fi
+                    rm -f -- "$RELAY_XRAY_PID_FILE"
+                    sleep 1
+                    mkdir -p /run/xray || return 1
+                    chmod 700 /run/xray 2>/dev/null || true
+                    if [ "$STATE_LOCK_OWNED" = "true" ] && [[ "$STATE_LOCK_FD" =~ ^[0-9]+$ ]]; then
+                        nohup "$RELAY_XRAY_BIN" run -c "$RELAY_XRAY_CONFIG" >> /var/log/xray.log 2>&1 8>&- 9>&- 219>&- {STATE_LOCK_FD}>&- &
+                    else
+                        nohup "$RELAY_XRAY_BIN" run -c "$RELAY_XRAY_CONFIG" >> /var/log/xray.log 2>&1 8>&- 9>&- 219>&- &
+                    fi
+                    printf '%s\n' "$!" > "$RELAY_XRAY_PID_FILE"
+                    sleep 1
+                    _is_pid_file_running_cmd "$RELAY_XRAY_PID_FILE" "$RELAY_XRAY_BIN"
+                    ;;
+                *) return 1 ;;
+            esac ;;
+        *) return 1 ;;
+    esac
+}
+
+_relay_xray_restart_checked() {
+    "$RELAY_XRAY_BIN" run -test -config "$RELAY_XRAY_CONFIG" >/dev/null 2>&1 && _relay_xray_service restart
+}
+
+_relay_xray_add() {
+    local inbound="$1" bridge_port="$2" tag="$3" bridge_password="$4" payload
+    payload=$(jq --argjson inbound "$inbound" --argjson port "$bridge_port" --arg tag "$tag" --arg password "$bridge_password" '
+        .inbounds = (.inbounds // []) + [$inbound]
+        | .outbounds = (.outbounds // []) + [{tag:($tag + "-bridge-out"),protocol:"socks",settings:{address:"127.0.0.1",port:$port,user:"relay",pass:$password}}]
+        | .routing = (.routing // {})
+        | .routing.rules = [{type:"field",inboundTag:[$tag],outboundTag:($tag + "-bridge-out")}] + (.routing.rules // [])' "$RELAY_XRAY_CONFIG") || return 1
+    _atomic_write_json "$RELAY_XRAY_CONFIG" "$payload"
+}
+
+_relay_xray_add_direct() {
+    local inbound="$1" outbound="$2" tag="$3" payload
+    payload=$(jq --argjson inbound "$inbound" --argjson outbound "$outbound" --arg tag "$tag" '
+        .inbounds = (.inbounds // []) + [$inbound]
+        | .outbounds = (.outbounds // []) + [$outbound]
+        | .routing = (.routing // {})
+        | .routing.rules = [{type:"field",inboundTag:[$tag],outboundTag:$outbound.tag}] + (.routing.rules // [])
+    ' "$RELAY_XRAY_CONFIG") || return 1
+    _atomic_write_json "$RELAY_XRAY_CONFIG" "$payload"
+}
+
+_relay_xray_remove_direct() {
+    local tag="$1" outbound_tag="$2" payload
+    payload=$(jq --arg tag "$tag" --arg outbound_tag "$outbound_tag" '
+        .inbounds = [(.inbounds // [])[] | select(.tag != $tag)]
+        | .outbounds = [(.outbounds // [])[] | select(.tag != $outbound_tag)]
+        | .routing.rules = [(.routing.rules // [])[] | select(.inboundTag != [$tag] or .outboundTag != $outbound_tag)]
+    ' "$RELAY_XRAY_CONFIG") || return 1
+    _atomic_write_json "$RELAY_XRAY_CONFIG" "$payload"
+}
+
+_relay_xray_remove() {
+    local tag="$1" payload
+    payload=$(jq --arg tag "$tag" '
+        .inbounds = [(.inbounds // [])[] | select(.tag != $tag)]
+        | .outbounds = [(.outbounds // [])[] | select(.tag != ($tag + "-bridge-out"))]
+        | .routing.rules = [(.routing.rules // [])[] | select(.outboundTag != ($tag + "-bridge-out"))]' "$RELAY_XRAY_CONFIG") || return 1
+    _atomic_write_json "$RELAY_XRAY_CONFIG" "$payload"
 }
 
 _restart_checked() {
@@ -840,6 +960,45 @@ _remove_node_from_relay_yaml() {
 
 
 # 初始化辅助目录
+_init_xray_relay_state() {
+    local acquired=false links_file="${RELAY_AUX_DIR}/relay_links.json"
+    _install_yq || return 1
+    if [ "${SINGBOXLITE_LOCK_HELD:-0}" != 1 ]; then
+        _state_lock_acquire || return 1
+        acquired=true
+    fi
+    mkdir -p "$RELAY_AUX_DIR" || { [ "$acquired" = true ] && _state_lock_release; return 1; }
+    chmod 700 "$RELAY_AUX_DIR" 2>/dev/null || true
+    if [ ! -e "$links_file" ]; then
+        _atomic_write_json "$links_file" '{}' || { [ "$acquired" = true ] && _state_lock_release; return 1; }
+    fi
+    if [ ! -e "$RELAY_CLASH_YAML" ]; then
+        cat > "$RELAY_CLASH_YAML" <<'EOF'
+proxies: []
+proxy-groups:
+  - name: 节点选择
+    type: select
+    proxies:
+      - 中转节点
+      - DIRECT
+  - name: 中转节点
+    type: select
+    proxies:
+      - DIRECT
+rules:
+  - GEOIP,PRIVATE,DIRECT,no-resolve
+  - GEOIP,CN,DIRECT
+  - MATCH,节点选择
+EOF
+    fi
+    _secure_state_file "$links_file"
+    _secure_state_file "$RELAY_CLASH_YAML"
+    _ensure_relay_yaml_groups
+    local rc=$?
+    [ "$acquired" = true ] && _state_lock_release
+    return "$rc"
+}
+
 _init_relay_dirs() {
     local acquired="false"
     if [ "${SINGBOXLITE_LOCK_HELD:-0}" != "1" ]; then
@@ -1068,6 +1227,53 @@ _validate_imported_outbound() {
     ' >/dev/null 2>&1
 }
 
+# 第三方节点沿用既有严格解析，再只为 XHTTP 入口转换为 Xray 原生出站。
+_xray_outbound_from_singbox() {
+    local singbox_outbound="$1" outbound_tag="$2" pin="" server port sni
+    if printf '%s' "$singbox_outbound" | jq -e '.tls.enabled == true and .tls.insecure == true' >/dev/null 2>&1; then
+        IFS=$'\t' read -r server port sni <<< "$(printf '%s' "$singbox_outbound" | jq -r '[.server,(.server_port|tostring),(.tls.server_name // "")] | @tsv')"
+        _https_proxy_tls_args "$server" "$port" "$sni"
+        pin=$(timeout 8 openssl s_client "${_HTTPS_TLS_ARGS[@]}" -showcerts </dev/null 2>/dev/null \
+            | openssl x509 -noout -fingerprint -sha256 2>/dev/null \
+            | sed -n 's/^.*=//p' | tr -d ':\r\n' | tr 'A-F' 'a-f')
+        if [[ ! "$pin" =~ ^[0-9a-f]{64}$ ]]; then
+            _error "无法读取落地节点的 TLS 证书指纹；Xray 不支持直接跳过证书校验，已取消导入。" >&2
+            return 1
+        fi
+        _warn "Xray 将固定当前落地证书的 SHA-256 指纹；证书更新后需重新导入此中转。" >&2
+    fi
+    jq -n --argjson sb "$singbox_outbound" --arg tag "$outbound_tag" --arg pin "$pin" '
+        if $sb.type == "vless" then
+            {tag:$tag,protocol:"vless",settings:{address:$sb.server,port:$sb.server_port,id:$sb.uuid,encryption:"none",flow:($sb.flow // "")},
+             streamSettings:{network:(if $sb.transport.type? == "ws" then "ws" else "raw" end),
+               security:(if $sb.tls.reality.enabled? == true then "reality" elif $sb.tls.enabled? == true then "tls" else "none" end)}}
+            | if $sb.transport.type? == "ws" then
+                .streamSettings.wsSettings = {path:$sb.transport.path,headers:$sb.transport.headers}
+              else . end
+            | if $sb.tls.reality.enabled? == true then
+                .streamSettings.realitySettings = {serverName:$sb.tls.server_name,fingerprint:$sb.tls.utls.fingerprint,
+                  password:$sb.tls.reality.public_key,shortId:$sb.tls.reality.short_id}
+              elif $sb.tls.enabled? == true then
+                .streamSettings.tlsSettings = {serverName:$sb.tls.server_name,
+                  fingerprint:($sb.tls.utls.fingerprint // "chrome")}
+                | if $pin != "" then .streamSettings.tlsSettings.pinnedPeerCertSha256=$pin else . end
+              else . end
+        elif $sb.type == "shadowsocks" then
+            {tag:$tag,protocol:"shadowsocks",settings:{address:$sb.server,port:$sb.server_port,method:$sb.method,password:$sb.password}}
+        elif $sb.type == "http" then
+            {tag:$tag,protocol:"http",settings:{address:$sb.server,port:$sb.server_port}}
+            | if $sb.username? != null then .settings.user=$sb.username | .settings.pass=$sb.password else . end
+            | if $sb.tls.enabled? == true then
+                .streamSettings={security:"tls",tlsSettings:{serverName:$sb.tls.server_name}}
+                | if $pin != "" then .streamSettings.tlsSettings.pinnedPeerCertSha256=$pin else . end
+              else . end
+        elif $sb.type == "socks" then
+            {tag:$tag,protocol:"socks",settings:{address:$sb.server,port:$sb.server_port}}
+            | if $sb.username? != null then .settings.user=$sb.username | .settings.pass=$sb.password else . end
+        else error("unsupported Xray landing protocol") end
+    ' 2>/dev/null
+}
+
 _manual_http_outbound() {
     local server port tls_choice sni username password
     echo "  示例（HTTPS）：地址 203.0.113.10，端口 443，启用 TLS，证书域名 proxy.example.com。" >&2
@@ -1280,6 +1486,7 @@ _manual_socks_outbound() {
 
 # --- 2.1 导入第三方节点 ---
 _import_link_config() {
+    mkdir -p "$SINGBOX_DIR" && chmod 700 "$SINGBOX_DIR" || return 1
     echo -e "${CYAN}"
     echo '  ╔═══════════════════════════════════════╗'
     echo '  ║     中转机：导入第三方落地节点        ║'
@@ -1302,7 +1509,7 @@ _import_link_config() {
     local choice parser_mode validation_mode outbound_json parser_status share_link
     read -r -p "  请选择第三方节点类型 [0-11]: " choice
     case "$choice" in
-        0) return ;;
+        0) _menu_skip_pause; return ;;
         1) parser_mode="vless-reality-vision" ;;
         2) parser_mode="vless-ws-tls" ;;
         3) parser_mode="vless-tcp" ;;
@@ -1310,7 +1517,7 @@ _import_link_config() {
         5) parser_mode="ss-aes-256-gcm" ;;
         6) parser_mode="https-proxy" ;;
         7)
-            outbound_json=$(_manual_http_outbound) || { read -r -p "  按回车键返回..."; return; }
+            outbound_json=$(_manual_http_outbound) || { _menu_pause; return; }
             if echo "$outbound_json" | jq -e '.tls.enabled == true' >/dev/null 2>&1; then
                 validation_mode="https-proxy"
             else
@@ -1319,22 +1526,22 @@ _import_link_config() {
             ;;
         8)
             validation_mode="socks5-none"
-            outbound_json=$(_manual_socks_outbound none) || { read -r -p "  按回车键返回..."; return; }
+            outbound_json=$(_manual_socks_outbound none) || { _menu_pause; return; }
             ;;
         9)
             validation_mode="socks5-auth"
-            outbound_json=$(_manual_socks_outbound auth) || { read -r -p "  按回车键返回..."; return; }
+            outbound_json=$(_manual_socks_outbound auth) || { _menu_pause; return; }
             ;;
         10) parser_mode="ss-2022-aes-128-gcm" ;;
         11) parser_mode="ss-2022-aes-256-gcm" ;;
-        *) _error "无效选项"; read -r -p "  按回车键返回..."; return ;;
+        *) _error "无效选项"; _menu_pause; return ;;
     esac
 
     if [ -n "$parser_mode" ]; then
         if [[ "$parser_mode" == ss-2022-* ]]; then
             _info "SS2022 需要 Base64 密钥和准确时间；分享链接无法表达的 Multiplex/Padding 设置不会自动启用。"
         fi
-        _check_parser || { read -r -p "  按回车键返回..."; return; }
+        _check_parser || { _menu_pause; return; }
         local PARSER_BIN="$_PARSER_PATH"
         if [ "$parser_mode" = "https-proxy" ]; then
             echo "  HTTPS 示例：https://203.0.113.10:443?sni=proxy.example.com" >&2
@@ -1342,7 +1549,7 @@ _import_link_config() {
             _info "IP 连接域名证书请加 ?sni=证书域名；仅输入 host:port 目前按 HTTPS 处理。"
         fi
         read -r -p "  请输入对应类型的节点分享链接: " share_link
-        [ -n "$share_link" ] || { _error "节点链接不能为空"; read -r -p "  按回车键返回..."; return; }
+        [ -n "$share_link" ] || { _error "节点链接不能为空"; _menu_pause; return; }
         _info "正在按 ${parser_mode} 严格解析链接..."
         outbound_json=$(printf '%s\n' "$share_link" | bash "$PARSER_BIN" "$parser_mode")
         parser_status=$?
@@ -1351,7 +1558,7 @@ _import_link_config() {
             parser_error=$(printf '%s' "$outbound_json" | jq -r '.error // empty' 2>/dev/null)
             _error "链接解析失败（解析器退出码: ${parser_status}）"
             [ -n "$parser_error" ] && _error "$parser_error"
-            read -r -p "  按回车键返回..."
+            _menu_pause
             return
         fi
         validation_mode="$parser_mode"
@@ -1366,35 +1573,35 @@ _import_link_config() {
 
     if ! _validate_imported_outbound "$validation_mode" "$outbound_json"; then
         _error "解析结果不符合所选协议的严格 schema，已拒绝导入"
-        read -r -p "  按回车键返回..."
+        _menu_pause
         return
     fi
 
     if [ "$validation_mode" = "https-proxy" ]; then
         outbound_json=$(_review_https_proxy_tls "$outbound_json") || {
-            read -r -p "  按回车键返回..."
+            _menu_pause
             return 1
         }
         if ! _validate_imported_outbound "$validation_mode" "$outbound_json"; then
             _error "HTTPS 证书探测结果未通过配置校验"
-            read -r -p "  按回车键返回..."
+            _menu_pause
             return 1
         fi
     fi
 
     outbound_json=$(printf '%s' "$outbound_json" | jq -c '.tag = "TEMP_TAG"') || {
         _error "解析结果不是有效 JSON"
-        read -r -p "  按回车键返回..."
+        _menu_pause
         return
     }
     local dest_type dest_addr dest_port
     IFS=$'\t' read -r dest_type dest_addr dest_port <<< "$(printf '%s' "$outbound_json" | jq -r '[.type,.server,(.server_port|tostring)] | @tsv')"
     if ! _valid_server_address "$dest_addr"; then
         _error "解析结果中的服务器地址无效"
-        read -r -p "  按回车键返回..."
+        _menu_pause
         return 1
     fi
-    _finalize_relay_setup "$dest_type" "$dest_addr" "$dest_port" "$outbound_json" || { read -r -p "  按回车键返回..."; return 1; }
+    _finalize_relay_setup "$dest_type" "$dest_addr" "$dest_port" "$outbound_json" || { _menu_pause_if_needed; return 1; }
 }
 
 # 检查依赖 (主脚本已预装绝大部分，此处仅做快速校验)
@@ -1486,6 +1693,11 @@ _landing_config() {
     
     read -p "  请选择落地节点编号: " choice
     if ! [[ "$choice" =~ ^[1-9][0-9]*$ ]] || [ "$choice" -ge "$i" ]; then
+        if [ "$choice" = 0 ] || [ -z "$choice" ]; then
+            _menu_skip_pause
+        else
+            _error "无效序号"
+        fi
         return
     fi
     
@@ -1692,7 +1904,7 @@ _landing_config() {
         _error "Token 生成失败。"
     fi
     
-    read -p "  按回车继续..."
+    _menu_pause
 }
 
 # 清理由尚未提交的中转创建流程产生的精确资产，不触碰其他模块证书或 PF。
@@ -1707,6 +1919,70 @@ _cleanup_pending_relay_assets() {
 
 # --- 通用：完成中转配置 (Inbound + Outbound写入) ---
 # 参数: $1=dest_type, $2=dest_addr, $3=dest_port, $4=outbound_json
+_create_xray_direct_relay() {
+    local xray_inbound="$1" xray_outbound="$2" inbound_tag="$3" outbound_tag="$4"
+    local listen_port="$5" node_name="$6" link="$7" proxy_json="$8"
+    local dest_label="$9" dest_addr="${10}" dest_port="${11}" relay_type="${12}" listen_network="${13}"
+    local links_file="${RELAY_AUX_DIR}/relay_links.json" txn_dir metadata tmp failed=false
+    _state_lock_acquire || return 1
+    txn_dir=$(_txn_begin) || { _state_lock_release; return 1; }
+    if ! _txn_snapshot_file "$txn_dir" xray "$RELAY_XRAY_CONFIG" \
+        || ! _txn_snapshot_file "$txn_dir" links "$links_file" \
+        || ! _txn_snapshot_file "$txn_dir" clash "$RELAY_CLASH_YAML"; then
+        _txn_cleanup "$txn_dir"; _state_lock_release
+        _error "无法创建 Xray 中转状态快照"
+        return 1
+    fi
+    if _network_port_conflict "$listen_port" "$listen_network" \
+        || jq -e --arg tag "$inbound_tag" --arg out "$outbound_tag" \
+            'any(.inbounds[]?; .tag == $tag) or any(.outbounds[]?; .tag == $out)' "$RELAY_XRAY_CONFIG" >/dev/null 2>&1 \
+        || jq -e --arg tag "$inbound_tag" 'has($tag)' "$links_file" >/dev/null 2>&1; then
+        _error "提交前发现入口端口或 Xray 中转标签已被占用"
+        _txn_cleanup "$txn_dir"; _state_lock_release
+        return 1
+    fi
+    export PROXY_NAME="$node_name"
+    if "$YQ_BINARY" eval -e '.proxies[] | select(.name == strenv(PROXY_NAME))' "$RELAY_CLASH_YAML" >/dev/null 2>&1; then
+        _error "Clash 节点名称已存在: $node_name"
+        _txn_cleanup "$txn_dir"; _state_lock_release
+        return 1
+    fi
+    metadata=$(jq -n --arg link "$link" --arg created "$(date '+%Y-%m-%d %H:%M:%S')" \
+        --arg name "$node_name" --arg landing_type "$dest_label" --arg landing_addr "${dest_addr}:${dest_port}" \
+        --arg tag "$outbound_tag" --arg relay_type "$relay_type" --argjson port "$listen_port" '
+        {link:$link,created_at:$created,engine:"xray",relay_type:$relay_type,
+         xray_outbound_tag:$tag,landing_type:$landing_type,landing_addr:$landing_addr,node_name:$name,listen_port:$port}') || failed=true
+    if [ "$failed" = false ]; then
+        _relay_xray_add_direct "$xray_inbound" "$xray_outbound" "$inbound_tag" || failed=true
+    fi
+    if [ "$failed" = false ]; then
+        _atomic_modify_json "$links_file" ". + {\"$inbound_tag\": $metadata}" || failed=true
+    fi
+    if [ "$failed" = false ]; then
+        _add_node_to_relay_yaml "$proxy_json" || failed=true
+    fi
+    if [ "$failed" = false ]; then
+        _relay_xray_restart_checked || failed=true
+    fi
+    if [ "$failed" = true ]; then
+        _txn_restore_file "$txn_dir" xray "$RELAY_XRAY_CONFIG"
+        _txn_restore_file "$txn_dir" links "$links_file"
+        _txn_restore_file "$txn_dir" clash "$RELAY_CLASH_YAML"
+        _relay_xray_service restart >/dev/null 2>&1 || true
+        _txn_cleanup "$txn_dir"; _state_lock_release
+        _error "Xray 中转提交失败，已恢复原配置"
+        return 1
+    fi
+    _txn_cleanup "$txn_dir"; _state_lock_release
+    _log_operation "CREATE_XRAY_RELAY" "Port: $listen_port, Landing: ${dest_label}@${dest_addr}:${dest_port}"
+    _success "${relay_type} 中转已由 Xray 生效"
+    echo -e "  节点名称: ${GREEN}${node_name}${NC}"
+    echo -e "  落地地址: ${CYAN}${dest_addr}:${dest_port}${NC}"
+    echo -e "  本机监听: ${CYAN}${listen_port}${NC}"
+    echo -e "分享链接:\n${CYAN}${link}${NC}"
+    _menu_pause
+}
+
 _finalize_relay_setup() {
     local dest_type="$1"
     local dest_addr="$2"
@@ -1744,34 +2020,72 @@ _finalize_relay_setup() {
     # --- 选择中转入口协议 ---
     echo -e "\n  ${CYAN}【请选择本机的 [中转入口] 协议】${NC}"
     echo -e "    ${GREEN}[1]${NC} VLESS + TCP + Reality + Vision"
-    echo -e "    ${GREEN}[2]${NC} Hysteria2"
-    echo -e "    ${GREEN}[3]${NC} TUICv5"
-    echo -e "    ${GREEN}[4]${NC} AnyTLS"
-    echo -e "    ${GREEN}[5]${NC} Shadowsocks aes-256-gcm"
+    echo -e "    ${GREEN}[2]${NC} VLESS + TCP (明文)"
+    echo -e "    ${GREEN}[3]${NC} VLESS + XHTTP + Reality (Xray)"
+    echo -e "    ${GREEN}[4]${NC} Hysteria2 (sing-box)"
+    echo -e "    ${GREEN}[5]${NC} TUICv5 (sing-box)"
+    echo -e "    ${GREEN}[6]${NC} AnyTLS (sing-box)"
+    echo -e "    ${GREEN}[7]${NC} Shadowsocks aes-128-gcm"
+    echo -e "    ${GREEN}[8]${NC} Shadowsocks aes-256-gcm"
+    echo -e "    ${GREEN}[9]${NC} Shadowsocks 2022-blake3-aes-128-gcm"
+    echo -e "    ${GREEN}[10]${NC} Shadowsocks 2022-blake3-aes-256-gcm"
+    echo -e "    ${GREEN}[11]${NC} VLESS + WebSocket + TLS (CF 回源)"
     echo ""
-    read -p "  请输入选项 [1-5]: " relay_choice
+    read -p "  请输入选项 [1-11]: " relay_choice
     
-    local relay_type=""
+    local relay_type="" relay_engine="" ss_method="" engine_choice=""
     local listen_network="tcp"
     case "$relay_choice" in
         1) relay_type="vless-reality" ;;
-        2) relay_type="hysteria2"; listen_network="udp" ;;
-        3) relay_type="tuic"; listen_network="udp" ;;
-        4) relay_type="anytls" ;;
-        5) relay_type="shadowsocks" ;;
+        2) relay_type="vless-tcp" ;;
+        3) relay_type="vless-xhttp-reality"; relay_engine="xray" ;;
+        4) relay_type="hysteria2"; relay_engine="sing-box"; listen_network="udp" ;;
+        5) relay_type="tuic"; relay_engine="sing-box"; listen_network="udp" ;;
+        6) relay_type="anytls"; relay_engine="sing-box" ;;
+        7) relay_type="shadowsocks"; ss_method="aes-128-gcm" ;;
+        8) relay_type="shadowsocks"; ss_method="aes-256-gcm" ;;
+        9) relay_type="shadowsocks"; ss_method="2022-blake3-aes-128-gcm" ;;
+        10) relay_type="shadowsocks"; ss_method="2022-blake3-aes-256-gcm" ;;
+        11) relay_type="vless-ws-tls" ;;
         *) _error "无效选项"; return 1 ;;
     esac
+    if [ -z "$relay_engine" ]; then
+        if [ -x "$SINGBOX_BIN" ] && [ -x "$RELAY_XRAY_BIN" ] && [ -s "$RELAY_XRAY_CONFIG" ]; then
+            echo "  [1] sing-box  [2] Xray"
+            read -r -p "  请选择中转核心 [1-2]: " engine_choice || return 1
+            case "$engine_choice" in 1) relay_engine="sing-box" ;; 2) relay_engine="xray" ;; *) _error "无效核心选项"; return 1 ;; esac
+        elif [ -x "$SINGBOX_BIN" ]; then relay_engine="sing-box"
+        elif [ -x "$RELAY_XRAY_BIN" ] && [ -s "$RELAY_XRAY_CONFIG" ]; then relay_engine="xray"
+        else _error "请先安装 sing-box 或 Xray 核心"; return 1
+        fi
+    fi
+    if [ "$relay_engine" = "xray" ]; then
+        _relay_xray_ready && _init_xray_relay_state || return 1
+    else
+        _require_relay_core || return 1
+    fi
+    if [ "$relay_type" = "vless-ws-tls" ] && [ "$relay_engine" = xray ]; then
+        _warn "Xray 26.10.31 已提示 WebSocket 传输弃用；此入口可用，但长期使用建议选择 sing-box 核心。"
+    fi
+    [ "$relay_type" != "shadowsocks" ] || listen_network="tcp+udp"
+    [ "$relay_type" != "vless-tcp" ] || _warn "纯 VLESS + TCP 不加密；v2rayN 使用新版 Xray 核心时会拒绝公网地址，请选 sing-box 核心或改用加密协议。"
+    if [[ "$ss_method" == 2022-* && "$relay_engine" == xray ]]; then
+        _warn "Xray SS2022 依赖准确的系统时间；容器时钟偏差可能导致连接失败。"
+    fi
     
     # 分享链接和 Clash 使用客户端连接中转入口的地址，不能假定出口 IP 就是入口 IP。
     local detected_relay_ip relay_server_ip input_relay_ip
     detected_relay_ip=$(_get_public_ip)
     while true; do
-        if [ -n "$detected_relay_ip" ]; then
+        if [ "$relay_type" = "vless-ws-tls" ]; then
+            read -r -p "  请输入客户端连接的 CF 代理域名或优选 IP（必填）: " input_relay_ip || return 1
+            [ -n "$input_relay_ip" ] || { _error "CF 入口必须填写客户端连接地址"; continue; }
+        elif [ -n "$detected_relay_ip" ]; then
             read -r -p "  请输入客户端连接中转入口的 IP 或域名 (回车默认: ${detected_relay_ip}): " input_relay_ip || return 1
         else
             read -r -p "  无法自动检测入口 IP，请输入客户端连接中转入口的 IP 或域名: " input_relay_ip || return 1
         fi
-        relay_server_ip="${input_relay_ip:-$detected_relay_ip}"
+        if [ "$relay_type" = "vless-ws-tls" ]; then relay_server_ip="$input_relay_ip"; else relay_server_ip="${input_relay_ip:-$detected_relay_ip}"; fi
         if [[ "$relay_server_ip" == \[*\] ]]; then
             relay_server_ip="${relay_server_ip:1:${#relay_server_ip}-2}"
         fi
@@ -1808,9 +2122,23 @@ _finalize_relay_setup() {
             break
         fi
     done
+
+    if [ "$relay_type" = "vless-ws-tls" ]; then
+        case "$listen_port" in
+            443|2053|2083|2087|2096|8443) ;;
+            *) _warn "${listen_port} 不是 CF 标准代理的 HTTPS 端口；如在 CF 配置 443 → ${listen_port} 回源规则，生成的分享链接和 Clash 端口需改为 443。" ;;
+        esac
+    fi
     
     local entrance_sni=""
-    if [ "$relay_type" != "shadowsocks" ]; then
+    if [ "$relay_type" = "vless-ws-tls" ]; then
+        read -r -p "  请输入 CF 代理域名（用于 TLS SNI 和 WS Host）: " entrance_sni || return 1
+        if [[ ! "$entrance_sni" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || [[ "$entrance_sni" != *.* ]]; then
+            _error "请输入有效的 CF 代理域名"
+            return 1
+        fi
+        _info "客户端连接地址应填写该 CF 代理域名；如使用 CF 优选 IP，SNI/Host 仍须保持该域名。"
+    elif [ "$relay_type" != "shadowsocks" ] && [ "$relay_type" != "vless-tcp" ]; then
         read -p "  请输入中转机入口 SNI (回车默认 www.amd.com): " entrance_sni
         [[ -z "$entrance_sni" ]] && entrance_sni="www.amd.com"
     fi
@@ -1839,11 +2167,47 @@ _finalize_relay_setup() {
     local link=""
     local keypair=""
     local pbk=""
+    local xray_inbound="" xhttp_path="" ws_path=""
     
     # 证书处理 (仅中转入口使用)
     local cert_path="${RELAY_AUX_DIR}/${inbound_tag}.pem"
     local key_path="${RELAY_AUX_DIR}/${inbound_tag}.key"
-    if [[ "$relay_type" == "hysteria2" || "$relay_type" == "tuic" || "$relay_type" == "anytls" ]]; then
+    if [ "$relay_type" = "vless-ws-tls" ]; then
+        local cert_choice="" source_cert="" source_key="" cert_pub="" key_pub=""
+        if [ -e "$cert_path" ] || [ -e "$key_path" ]; then
+            _error "中转入口证书文件已存在，避免覆盖: $inbound_tag"
+            return 1
+        fi
+        ws_path="/$(openssl rand -hex 8)" || return 1
+        read -r -p "  请输入 WebSocket 路径 (回车随机 ${ws_path}): " custom_path || return 1
+        ws_path="${custom_path:-$ws_path}"
+        if [[ "$ws_path" != /* || "$ws_path" == *[[:space:]?#]* ]]; then
+            _error "WebSocket 路径须以 / 开头，且不能包含空白、? 或 #"
+            return 1
+        fi
+        echo "  [1] 使用已有证书与私钥（CF Full (strict) 推荐受信任证书或 Origin CA）"
+        echo "  [2] 生成自签证书（仅适用于 CF Full，不能用于 Full (strict)）"
+        read -r -p "  请选择回源证书 [1-2]: " cert_choice || return 1
+        case "$cert_choice" in
+            1)
+                read -r -p "  请输入证书文件路径（fullchain.pem 或 Origin CA 证书）: " source_cert || return 1
+                read -r -p "  请输入私钥文件路径: " source_key || return 1
+                [ -f "$source_cert" ] && [ -f "$source_key" ] || { _error "证书或私钥文件不存在"; return 1; }
+                openssl x509 -in "$source_cert" -noout -checkend 0 >/dev/null 2>&1 && openssl pkey -in "$source_key" -noout >/dev/null 2>&1 || { _error "证书已过期，或证书/私钥格式无效"; return 1; }
+                cert_pub=$(openssl x509 -in "$source_cert" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256 2>/dev/null) || return 1
+                key_pub=$(openssl pkey -in "$source_key" -pubout -outform DER 2>/dev/null | openssl dgst -sha256 2>/dev/null) || return 1
+                [ -n "$cert_pub" ] && [ "$cert_pub" = "$key_pub" ] || { _error "证书与私钥不匹配"; return 1; }
+                openssl x509 -in "$source_cert" -noout -checkhost "$entrance_sni" 2>/dev/null | grep -q 'does match' || { _error "证书不匹配 CF 代理域名: $entrance_sni"; return 1; }
+                cp -- "$source_cert" "$cert_path" && cp -- "$source_key" "$key_path" || { _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "" "$cert_path" "$key_path"; _error "复制回源证书失败"; return 1; }
+                ;;
+            2)
+                openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout "$key_path" -out "$cert_path" -subj "/CN=${entrance_sni}" -addext "subjectAltName=DNS:${entrance_sni}" >/dev/null 2>&1 || { _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "" "$cert_path" "$key_path"; _error "生成自签证书失败"; return 1; }
+                _warn "自签证书仅适用于 CF Full；回源证书不会被验证，请优先使用 Full (strict)。"
+                ;;
+            *) _error "无效证书选项"; return 1 ;;
+        esac
+        chmod 600 "$cert_path" "$key_path" 2>/dev/null || true
+    elif [[ "$relay_type" == "hysteria2" || "$relay_type" == "tuic" || "$relay_type" == "anytls" ]]; then
         _info "正在生成中转入口自签名证书..."
         if ! openssl ecparam -genkey -name prime256v1 -out "$key_path" >/dev/null 2>&1 \
             || ! openssl req -new -x509 -days 3650 -key "$key_path" -out "$cert_path" -subj "/CN=${entrance_sni}" >/dev/null 2>&1; then
@@ -1860,7 +2224,60 @@ _finalize_relay_setup() {
     # 客户端连接地址已在生成配置前确认；IPv6 分享链接需要加方括号。
     local link_ip="$relay_server_ip"; [[ "$relay_server_ip" == *":"* ]] && link_ip="[$relay_server_ip]"
     
-    if [ "$relay_type" == "vless-reality" ]; then
+    if [ "$relay_type" == "vless-ws-tls" ]; then
+        local uuid
+        if [ "$relay_engine" = xray ]; then
+            uuid=$("$RELAY_XRAY_BIN" uuid) || { _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "" "$cert_path" "$key_path"; return 1; }
+            xray_inbound=$(jq -n --arg t "$inbound_tag" --argjson p "$listen_port" --arg u "$uuid" --arg cert "$cert_path" --arg key "$key_path" --arg path "$ws_path" \
+                '{tag:$t,listen:"::",port:$p,protocol:"vless",settings:{clients:[{id:$u}],decryption:"none"},streamSettings:{network:"ws",security:"tls",tlsSettings:{certificates:[{certificateFile:$cert,keyFile:$key}],alpn:["http/1.1"]},wsSettings:{path:$path}}}') || { _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "" "$cert_path" "$key_path"; return 1; }
+        else
+            uuid=$("$SINGBOX_BIN" generate uuid) || { _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "" "$cert_path" "$key_path"; return 1; }
+            inbound_json=$(jq -n --arg t "$inbound_tag" --argjson p "$listen_port" --arg u "$uuid" --arg sn "$entrance_sni" --arg cert "$cert_path" --arg key "$key_path" --arg path "$ws_path" \
+                '{type:"vless",tag:$t,listen:"::",listen_port:$p,users:[{uuid:$u}],tls:{enabled:true,server_name:$sn,alpn:["http/1.1"],certificate_path:$cert,key_path:$key},transport:{type:"ws",path:$path}}') || { _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "" "$cert_path" "$key_path"; return 1; }
+        fi
+        link="vless://${uuid}@${link_ip}:${listen_port}?encryption=none&security=tls&sni=$(_url_encode "$entrance_sni")&type=ws&host=$(_url_encode "$entrance_sni")&path=$(_url_encode "$ws_path")#$(_url_encode "$node_name")"
+    elif [ "$relay_type" == "vless-xhttp-reality" ]; then
+        local uuid raw_keys pk sid
+        uuid=$("$RELAY_XRAY_BIN" uuid) || return 1
+        raw_keys=$("$RELAY_XRAY_BIN" x25519) || return 1
+        pk=$(printf '%s\n' "$raw_keys" | awk 'NR==1 {print $NF}')
+        pbk=$(printf '%s\n' "$raw_keys" | awk 'NR==2 {print $NF}')
+        sid=$(openssl rand -hex 8) || return 1
+        if [ -z "$pk" ] || [ -z "$pbk" ]; then _error "Xray Reality 密钥生成失败"; return 1; fi
+        xhttp_path="/$(openssl rand -hex 6)" || return 1
+        read -r -p "  请输入 XHTTP 路径 (回车默认 ${xhttp_path}): " custom_path || return 1
+        xhttp_path="${custom_path:-$xhttp_path}"
+        if [[ "$xhttp_path" != /* || "$xhttp_path" == *[[:space:]?#]* ]]; then
+            _error "XHTTP 路径须以 / 开头，且不能包含空白、? 或 #"
+            return 1
+        fi
+        xray_inbound=$(jq -n --arg t "$inbound_tag" --argjson p "$listen_port" --arg u "$uuid" --arg sn "$entrance_sni" --arg pk "$pk" --arg sid "$sid" --arg path "$xhttp_path" \
+            '{tag:$t,listen:"::",port:$p,protocol:"vless",settings:{clients:[{id:$u,flow:""}],decryption:"none"},streamSettings:{network:"xhttp",security:"reality",realitySettings:{show:false,dest:($sn + ":443"),xver:0,serverNames:[$sn],privateKey:$pk,shortIds:[$sid]},xhttpSettings:{path:$path}}}') || return 1
+        link="vless://${uuid}@${link_ip}:${listen_port}?security=reality&encryption=none&pbk=$(_url_encode "$pbk")&fp=chrome&type=xhttp&mode=auto&path=$(_url_encode "$xhttp_path")&sni=$(_url_encode "$entrance_sni")&sid=${sid}&support-x25519mlkem768=true#$(_url_encode "$node_name")"
+    elif [ "$relay_type" = "vless-tcp" ] && [ "$relay_engine" = xray ]; then
+        local uuid
+        uuid=$("$RELAY_XRAY_BIN" uuid) || return 1
+        xray_inbound=$(jq -n --arg t "$inbound_tag" --argjson p "$listen_port" --arg u "$uuid" \
+            '{tag:$t,listen:"::",port:$p,protocol:"vless",settings:{clients:[{id:$u}],decryption:"none"},streamSettings:{network:"raw",security:"none"}}') || return 1
+        link="vless://${uuid}@${link_ip}:${listen_port}?encryption=none&type=tcp#$(_url_encode "$node_name")"
+    elif [ "$relay_type" = "vless-tcp" ]; then
+        local uuid
+        uuid=$("$SINGBOX_BIN" generate uuid) || return 1
+        inbound_json=$(jq -n --arg t "$inbound_tag" --argjson p "$listen_port" --arg u "$uuid" \
+            '{type:"vless",tag:$t,listen:"::",listen_port:$p,users:[{uuid:$u}]}') || return 1
+        link="vless://${uuid}@${link_ip}:${listen_port}?encryption=none&type=tcp#$(_url_encode "$node_name")"
+    elif [ "$relay_type" = "vless-reality" ] && [ "$relay_engine" = xray ]; then
+        local uuid raw_keys pk sid flow="xtls-rprx-vision"
+        uuid=$("$RELAY_XRAY_BIN" uuid) || return 1
+        raw_keys=$("$RELAY_XRAY_BIN" x25519) || return 1
+        pk=$(printf '%s\n' "$raw_keys" | awk 'NR==1 {print $NF}')
+        pbk=$(printf '%s\n' "$raw_keys" | awk 'NR==2 {print $NF}')
+        sid=$(openssl rand -hex 8) || return 1
+        [ -n "$pk" ] && [ -n "$pbk" ] || { _error "Reality 密钥生成失败"; return 1; }
+        xray_inbound=$(jq -n --arg t "$inbound_tag" --argjson p "$listen_port" --arg u "$uuid" --arg sn "$entrance_sni" --arg pk "$pk" --arg sid "$sid" \
+            '{tag:$t,listen:"::",port:$p,protocol:"vless",settings:{clients:[{id:$u,flow:"xtls-rprx-vision"}],decryption:"none"},streamSettings:{network:"raw",security:"reality",realitySettings:{show:false,dest:($sn + ":443"),xver:0,serverNames:[$sn],privateKey:$pk,shortIds:[$sid]}}}') || return 1
+        link="vless://${uuid}@${link_ip}:${listen_port}?encryption=none&flow=${flow}&security=reality&sni=$(_url_encode "$entrance_sni")&fp=chrome&pbk=$(_url_encode "$pbk")&sid=${sid}&type=tcp&support-x25519mlkem768=true#$(_url_encode "$node_name")"
+    elif [ "$relay_type" == "vless-reality" ]; then
         local uuid=$($SINGBOX_BIN generate uuid)
         keypair=$($SINGBOX_BIN generate reality-keypair)
         local pk=$(echo "$keypair" | awk '/PrivateKey/ {print $2}')
@@ -1970,10 +2387,20 @@ _finalize_relay_setup() {
         link="anytls://${password}@${link_ip}:${listen_port}?security=tls&sni=${entrance_sni}&insecure=1&type=tcp${pin_param}#$(_url_encode "${node_name}")"
         
     elif [ "$relay_type" == "shadowsocks" ]; then
-        local method="aes-256-gcm"
-        local password=$($SINGBOX_BIN generate rand --hex 16)
-        inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg m "$method" --arg pw "$password" \
-            '{"type":"shadowsocks","tag":$t,"listen":"::","listen_port":($p|tonumber),"method":$m,"password":$pw}')
+        local method="$ss_method" password="" key_bytes=16
+        case "$method" in
+            aes-128-gcm|aes-256-gcm) password=$(openssl rand -hex 16) || return 1 ;;
+            2022-blake3-aes-128-gcm) password=$(openssl rand -base64 16) || return 1 ;;
+            2022-blake3-aes-256-gcm) password=$(openssl rand -base64 32) || return 1 ;;
+            *) _error "不支持的 Shadowsocks 加密方式"; return 1 ;;
+        esac
+        if [ "$relay_engine" = xray ]; then
+            xray_inbound=$(jq -n --arg t "$inbound_tag" --argjson p "$listen_port" --arg m "$method" --arg pw "$password" \
+                '{tag:$t,listen:"::",port:$p,protocol:"shadowsocks",settings:{method:$m,password:$pw,network:"tcp,udp"}}') || return 1
+        else
+            inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg m "$method" --arg pw "$password" \
+                '{"type":"shadowsocks","tag":$t,"listen":"::","listen_port":($p|tonumber),"method":$m,"password":$pw}') || return 1
+        fi
             
         local userinfo=$(printf '%s' "${method}:${password}" | base64 | tr -d '\n\r ' | tr '+/' '-_' | tr -d '=')
         link="ss://${userinfo}@${link_ip}:${listen_port}#$(_url_encode "${node_name}")"
@@ -1981,7 +2408,36 @@ _finalize_relay_setup() {
     
     # 构造 Clash 客户端节点，随后与 config/metadata 一起事务提交。
     local proxy_json=""
-    if [ "$relay_type" == "vless-reality" ]; then
+    if [ "$relay_type" == "vless-ws-tls" ]; then
+        local uuid
+        if [ "$relay_engine" = xray ]; then
+            uuid=$(printf '%s' "$xray_inbound" | jq -r '.settings.clients[0].id')
+        else
+            uuid=$(printf '%s' "$inbound_json" | jq -r '.users[0].uuid')
+        fi
+        proxy_json=$(jq -n --arg n "$node_name" --arg s "$relay_server_ip" --argjson p "$listen_port" --arg u "$uuid" --arg sn "$entrance_sni" --arg path "$ws_path" \
+            '{name:$n,type:"vless",server:$s,port:$p,uuid:$u,encryption:"none",tls:true,udp:true,sni:$sn,network:"ws","ws-opts":{path:$path,headers:{Host:$sn}}}') || { _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "" "$cert_path" "$key_path"; return 1; }
+    elif [ "$relay_type" == "vless-xhttp-reality" ]; then
+        local uuid=$(printf '%s' "$xray_inbound" | jq -r '.settings.clients[0].id')
+        local sid=$(printf '%s' "$xray_inbound" | jq -r '.streamSettings.realitySettings.shortIds[0]')
+        proxy_json=$(jq -n --arg n "$node_name" --arg s "$relay_server_ip" --arg p "$listen_port" --arg u "$uuid" --arg sn "$entrance_sni" --arg pbk "$pbk" --arg sid "$sid" --arg path "$xhttp_path" \
+            '{name:$n,type:"vless",server:$s,port:($p|tonumber),uuid:$u,encryption:"none",tls:true,servername:$sn,alpn:["h2"],network:"xhttp","client-fingerprint":"chrome","reality-opts":{"public-key":$pbk,"short-id":$sid,"support-x25519mlkem768":true},"xhttp-opts":{path:$path,mode:"stream-one"}}') || return 1
+    elif [ "$relay_type" = "vless-tcp" ]; then
+        local uuid
+        if [ "$relay_engine" = xray ]; then
+            uuid=$(printf '%s' "$xray_inbound" | jq -r '.settings.clients[0].id')
+        else
+            uuid=$(printf '%s' "$inbound_json" | jq -r '.users[0].uuid')
+        fi
+        proxy_json=$(jq -n --arg n "$node_name" --arg s "$relay_server_ip" --argjson p "$listen_port" --arg u "$uuid" \
+            '{name:$n,type:"vless",server:$s,port:$p,uuid:$u,encryption:"none",tls:false,network:"tcp"}') || return 1
+    elif [ "$relay_type" = "vless-reality" ] && [ "$relay_engine" = xray ]; then
+        local uuid sid
+        uuid=$(printf '%s' "$xray_inbound" | jq -r '.settings.clients[0].id')
+        sid=$(printf '%s' "$xray_inbound" | jq -r '.streamSettings.realitySettings.shortIds[0]')
+        proxy_json=$(jq -n --arg n "$node_name" --arg s "$relay_server_ip" --argjson p "$listen_port" --arg u "$uuid" --arg sn "$entrance_sni" --arg pbk "$pbk" --arg sid "$sid" \
+            '{name:$n,type:"vless",server:$s,port:$p,uuid:$u,encryption:"none",flow:"xtls-rprx-vision",tls:true,servername:$sn,network:"tcp","client-fingerprint":"chrome","reality-opts":{"public-key":$pbk,"short-id":$sid,"support-x25519mlkem768":true}}') || return 1
+    elif [ "$relay_type" == "vless-reality" ]; then
         local uuid=$(echo "$inbound_json" | jq -r '.users[0].uuid')
         local sn=$(echo "$inbound_json" | jq -r '.tls.server_name')
         local flow=$(echo "$inbound_json" | jq -r '.users[0].flow')
@@ -2007,8 +2463,14 @@ _finalize_relay_setup() {
         proxy_json=$(jq -n --arg n "$node_name" --arg s "$relay_server_ip" --arg p "$listen_port" --arg pw "$password" --arg sn "$sn" \
             '{name:$n,type:"anytls",server:$s,port:($p|tonumber),password:$pw,"client-fingerprint":"chrome",udp:true,sni:$sn,alpn:["h2","http/1.1"],"skip-cert-verify":true}')
     elif [ "$relay_type" == "shadowsocks" ]; then
-        local password=$(echo "$inbound_json" | jq -r '.password')
-        local method=$(echo "$inbound_json" | jq -r '.method')
+        local password method
+        if [ "$relay_engine" = xray ]; then
+            password=$(printf '%s' "$xray_inbound" | jq -r '.settings.password')
+            method=$(printf '%s' "$xray_inbound" | jq -r '.settings.method')
+        else
+            password=$(printf '%s' "$inbound_json" | jq -r '.password')
+            method=$(printf '%s' "$inbound_json" | jq -r '.method')
+        fi
         proxy_json=$(jq -n --arg n "$node_name" --arg s "$relay_server_ip" --arg p "$listen_port" --arg m "$method" --arg pw "$password" \
             '{name:$n,type:"ss",server:$s,port:($p|tonumber),cipher:$m,password:$pw,udp:true}')
     fi
@@ -2016,6 +2478,20 @@ _finalize_relay_setup() {
         _error "无法生成中转客户端配置"
         _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "${port_range:-}" "$cert_path" "$key_path"
         return 1
+    fi
+
+    if [ "$relay_engine" = xray ]; then
+        local xray_outbound
+        xray_outbound=$(_xray_outbound_from_singbox "$outbound_json" "$outbound_tag") || {
+            _error "该落地节点无法转换为 Xray 原生出站，未写入任何中转配置"
+            _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "" "$cert_path" "$key_path"
+            return 1
+        }
+        _create_xray_direct_relay "$xray_inbound" "$xray_outbound" "$inbound_tag" "$outbound_tag" \
+            "$listen_port" "$node_name" "$link" "$proxy_json" "$dest_label" "$dest_addr" "$dest_port" "$relay_type" "$listen_network"
+        local relay_result=$?
+        [ "$relay_result" -eq 0 ] || _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "" "$cert_path" "$key_path"
+        return "$relay_result"
     fi
 
     _info "正在事务写入中转配置..."
@@ -2026,7 +2502,8 @@ _finalize_relay_setup() {
     txn_dir=$(_txn_begin) || { _state_lock_release; _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "${port_range:-}" "$cert_path" "$key_path"; return 1; }
     if ! _txn_snapshot_file "$txn_dir" relay "$CONFIG_FILE" \
         || ! _txn_snapshot_file "$txn_dir" links "$LINKS_FILE" \
-        || ! _txn_snapshot_file "$txn_dir" clash "$RELAY_CLASH_YAML"; then
+        || ! _txn_snapshot_file "$txn_dir" clash "$RELAY_CLASH_YAML" \
+        || ! { [ "$relay_type" != "vless-xhttp-reality" ] || _txn_snapshot_file "$txn_dir" xray "$RELAY_XRAY_CONFIG"; }; then
         _error "无法创建中转状态快照"
         _txn_cleanup "$txn_dir"
         _state_lock_release
@@ -2041,6 +2518,12 @@ _finalize_relay_setup() {
         _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "${port_range:-}" "$cert_path" "$key_path"
         return 1
     fi
+    if [ "$relay_type" = "vless-xhttp-reality" ] && _network_port_conflict "$bridge_port" tcp; then
+        _error "提交前桥接端口 ${bridge_port} 已被占用"
+        _txn_cleanup "$txn_dir"
+        _state_lock_release
+        return 1
+    fi
     export PROXY_NAME="$node_name"
     if "$YQ_BINARY" eval -e '.proxies[] | select(.name == strenv(PROXY_NAME))' "$RELAY_CLASH_YAML" >/dev/null 2>&1; then
         _error "提交前发现 Clash 节点名称已存在: $node_name"
@@ -2050,7 +2533,8 @@ _finalize_relay_setup() {
         return 1
     fi
 
-    if jq -e --arg tag "$inbound_tag" '.inbounds[]? | select(.tag == $tag)' "$CONFIG_FILE" >/dev/null 2>&1; then
+    if jq -e --arg tag "$inbound_tag" '.inbounds[]? | select(.tag == $tag)' "$CONFIG_FILE" >/dev/null 2>&1 \
+        || { [ "$relay_type" = "vless-xhttp-reality" ] && jq -e --arg tag "$inbound_tag" '.inbounds[]? | select(.tag == $tag)' "$RELAY_XRAY_CONFIG" >/dev/null 2>&1; }; then
         _error "中转入口 tag 已存在: $inbound_tag"
         _txn_cleanup "$txn_dir"
         _state_lock_release
@@ -2069,17 +2553,21 @@ _finalize_relay_setup() {
 
     metadata=$(jq -n --arg link "$link" --arg created "$(date '+%Y-%m-%d %H:%M:%S')" --arg relay_type "$relay_type" \
         --arg landing_type "$dest_label" --arg landing_addr "${dest_addr}:${dest_port}" --arg node_name "$node_name" \
-        --argjson listen_port "$listen_port" --arg hop "${port_range:-}" \
-        '{link:$link,created_at:$created,relay_type:$relay_type,landing_type:$landing_type,landing_addr:$landing_addr,node_name:$node_name,listen_port:$listen_port} | if $hop != "" then .port_hopping=$hop else . end') || true
+        --argjson listen_port "$listen_port" --arg hop "${port_range:-}" --arg bridge_port "$bridge_port" \
+        '{link:$link,created_at:$created,relay_type:$relay_type,landing_type:$landing_type,landing_addr:$landing_addr,node_name:$node_name,listen_port:$listen_port} | if $hop != "" then .port_hopping=$hop else . end | if $bridge_port != "" then .bridge_port=($bridge_port|tonumber) else . end') || true
     tmp=$(_make_same_dir_tmp "$LINKS_FILE") || true
     if [ -z "$metadata" ] || [ -z "$tmp" ] || ! jq --arg tag "$inbound_tag" --argjson meta "$metadata" '.[$tag] = $meta' "$LINKS_FILE" > "$tmp" \
         || ! chmod 600 "$tmp" || ! mv -f "$tmp" "$LINKS_FILE" || ! _add_node_to_relay_yaml "$proxy_json" \
-        || ! _restart_checked; then
+        || ! { [ "$relay_type" != "vless-xhttp-reality" ] || _relay_xray_add "$xray_inbound" "$bridge_port" "$inbound_tag" "$bridge_password"; } \
+        || ! _restart_checked \
+        || ! { [ "$relay_type" != "vless-xhttp-reality" ] || _relay_xray_restart_checked; }; then
         [ -n "$tmp" ] && rm -f -- "$tmp"
         _txn_restore_file "$txn_dir" relay "$CONFIG_FILE"
         _txn_restore_file "$txn_dir" links "$LINKS_FILE"
         _txn_restore_file "$txn_dir" clash "$RELAY_CLASH_YAML"
+        [ "$relay_type" = "vless-xhttp-reality" ] && _txn_restore_file "$txn_dir" xray "$RELAY_XRAY_CONFIG"
         _manage_service restart >/dev/null 2>&1 || true
+        [ "$relay_type" = "vless-xhttp-reality" ] && _relay_xray_service restart >/dev/null 2>&1 || true
         _txn_cleanup "$txn_dir"
         _state_lock_release
         _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "${port_range:-}" "$cert_path" "$key_path"
@@ -2106,7 +2594,7 @@ _finalize_relay_setup() {
     echo -e "分享链接:"
     echo -e "${CYAN}$link${NC}"
     echo -e "${YELLOW}═════════════════════════════════════════════════${NC}"
-    read -p "  按回车键返回..."
+    _menu_pause
 }
 
 # --- 2. 中转机配置 (导入 Token) ---
@@ -2116,7 +2604,7 @@ _relay_config() {
     echo ""
     read -r token_input
     
-    if [ -z "$token_input" ]; then _error "输入为空。"; read -r -p "  按回车键返回..."; return; fi
+    if [ -z "$token_input" ]; then _error "输入为空。"; _menu_pause; return; fi
     
     local decoded_json
     
@@ -2129,7 +2617,7 @@ _relay_config() {
         decoded_json=$(printf '%s' "$encrypted_data" | openssl enc -aes-256-cbc -pbkdf2 -d -a -A -pass fd:3 3<<<"$passphrase" 2>/dev/null)
         if [ -z "$decoded_json" ] || ! echo "$decoded_json" | jq . >/dev/null 2>&1; then
             _error "Token 解密失败！密钥可能不正确。"
-            read -r -p "  按回车键返回..."
+            _menu_pause
             return
         fi
         _success "Token 解密成功。"
@@ -2142,7 +2630,7 @@ _relay_config() {
         decoded_json=$(printf '%s' "$legacy_encrypted_data" | openssl enc -aes-256-cbc -pbkdf2 -d -a -A -pass fd:3 3<<<"$legacy_passphrase" 2>/dev/null)
         if [ -z "$decoded_json" ] || ! printf '%s' "$decoded_json" | jq . >/dev/null 2>&1; then
             _error "旧版 Token 解密失败"
-            read -r -p "  按回车键返回..."
+            _menu_pause
             return
         fi
     else
@@ -2151,7 +2639,7 @@ _relay_config() {
         local decode_status=$?
         if [ $decode_status -ne 0 ] || [ -z "$decoded_json" ] || ! echo "$decoded_json" | jq . >/dev/null 2>&1; then
             _error "Token 无效或无法解码！"
-            read -r -p "  按回车键返回..."
+            _menu_pause
             return
         fi
         _warn "检测到旧版未加密 Token，建议在落地机重新生成加密版本。"
@@ -2182,8 +2670,8 @@ _relay_config() {
         fi
     fi
     
-    if [ -z "$outbound_json" ]; then _error "Token 解析失败"; read -r -p "  按回车键返回..."; return; fi
-    _finalize_relay_setup "$dest_type" "$dest_addr" "$dest_port" "$outbound_json" || { read -r -p "  按回车键返回..."; return 1; }
+    if [ -z "$outbound_json" ]; then _error "Token 解析失败"; _menu_pause; return; fi
+    _finalize_relay_setup "$dest_type" "$dest_addr" "$dest_port" "$outbound_json" || { _menu_pause_if_needed; return 1; }
 }
 
 # --- 3. 查看中转路由 ---
@@ -2196,18 +2684,16 @@ _view_relays() {
     echo -e "${NC}"
     
     local CONFIG_FILE="$RELAY_CONFIG_FILE"
-    if [ ! -f "$CONFIG_FILE" ]; then _error "配置文件不存在。"; return; fi
-    
-    local rules=$(jq -c '.route.rules[] | select(.inbound != null and .outbound != null and (.outbound | startswith("relay-out-")))' "$CONFIG_FILE" 2>/dev/null)
-    
-    if [ -z "$rules" ]; then
+    local LINKS_FILE="${RELAY_AUX_DIR}/relay_links.json"
+    local rules xray_rows
+    rules=$(jq -c '.route.rules[]? | select(.inbound != null and .outbound != null and (.outbound | startswith("relay-out-")))' "$CONFIG_FILE" 2>/dev/null)
+    xray_rows=$(jq -c 'to_entries[]? | select(.value.engine == "xray" and .value.xray_outbound_tag != null)' "$LINKS_FILE" 2>/dev/null)
+    if [ -z "$rules" ] && [ -z "$xray_rows" ]; then
         echo -e "\n    ${YELLOW}暂无活跃中转链路${NC}"
         echo ""
-        read -p "  按回车键继续..."
+        _menu_pause
         return
     fi
-    
-    local LINKS_FILE="${RELAY_AUX_DIR}/relay_links.json"
     local i=1
     
     while IFS= read -r rule; do
@@ -2236,49 +2722,80 @@ _view_relays() {
         echo -e "  ${GREEN}[$i]${NC} ${YELLOW}${node_name}${NC}"
         echo -e "      入口索引: ${CYAN}${in_tag}${NC}"
         echo -e "      中转方式: ${relay_type}"
+        if [ "$relay_type" = "vless-xhttp-reality" ]; then
+            echo -e "      公网端口: $(printf '%s' "$metadata" | jq -r '.listen_port // "未知"') (Xray)"
+            echo -e "      本机桥接: 127.0.0.1:$(printf '%s' "$metadata" | jq -r '.bridge_port // "未知"') (sing-box)"
+        fi
         echo -e "      落地目标: ${landing_info}"
         [ -n "$link" ] && echo -e "      分享链接: ${CYAN}${link}${NC}"
         echo "  -------------------------------------------------"
         ((i++))
     done <<< "$rules"
+
+    while IFS= read -r row; do
+        [ -n "$row" ] || continue
+        local tag name landing port link
+        tag=$(printf '%s' "$row" | jq -r '.key')
+        name=$(printf '%s' "$row" | jq -r '.value.node_name // .key')
+        landing=$(printf '%s' "$row" | jq -r '.value.landing_addr // "未知"')
+        port=$(printf '%s' "$row" | jq -r '.value.listen_port // "未知"')
+        link=$(printf '%s' "$row" | jq -r '.value.link // empty')
+        echo -e "  ${GREEN}[$i]${NC} ${YELLOW}${name}${NC}"
+        echo -e "      入口索引: ${CYAN}${tag}${NC}"
+        echo -e "      中转方式: $(printf '%s' "$row" | jq -r '.value.relay_type') (Xray)"
+        echo -e "      公网端口: ${port} (Xray)"
+        echo -e "      落地目标: ${landing}"
+        [ -z "$link" ] || echo -e "      分享链接: ${CYAN}${link}${NC}"
+        echo "  -------------------------------------------------"
+        i=$((i + 1))
+    done <<< "$xray_rows"
     
     echo ""
-    read -p "  按回车键继续..."
+    _menu_pause
 }
 
 # --- 4. 删除中转路由 ---
 _clear_all_relays() {
+    _init_xray_relay_state || return 1
     local CONFIG_FILE="$RELAY_CONFIG_FILE"
     local LINKS_FILE="${RELAY_AUX_DIR}/relay_links.json"
-    local txn_dir cleanup_rows relay_tags failed="false"
+    local txn_dir cleanup_rows relay_tags failed="false" xray_tags="" direct_tags="" legacy_present=false xray_present=false
+    direct_tags=$(jq -r 'to_entries[]? | select(.value.engine == "xray" and .value.xray_outbound_tag != null) | .key' "$LINKS_FILE" 2>/dev/null || true)
+    xray_tags=$(jq -r 'to_entries[]? | select(.value.relay_type == "vless-xhttp-reality" and .value.engine != "xray") | .key' "$LINKS_FILE" 2>/dev/null || true)
+    [ -z "$xray_tags$direct_tags" ] || { xray_present=true; _relay_xray_ready || return 1; }
+    if jq -e '.route.rules[]? | select((.outbound? // "") | startswith("relay-out-"))' "$CONFIG_FILE" >/dev/null 2>&1; then
+        legacy_present=true
+        _require_relay_core || return 1
+    fi
 
     _state_lock_acquire || return 1
     txn_dir=$(_txn_begin) || { _state_lock_release; return 1; }
     if ! _txn_snapshot_file "$txn_dir" relay "$CONFIG_FILE" \
         || ! _txn_snapshot_file "$txn_dir" links "$LINKS_FILE" \
-        || ! _txn_snapshot_file "$txn_dir" clash "$RELAY_CLASH_YAML"; then
+        || ! _txn_snapshot_file "$txn_dir" clash "$RELAY_CLASH_YAML" \
+        || ! { [ "$xray_present" != true ] || _txn_snapshot_file "$txn_dir" xray "$RELAY_XRAY_CONFIG"; }; then
         _error "无法创建中转状态快照，已取消清空"
         _txn_cleanup "$txn_dir"
         _state_lock_release
         return 1
     fi
 
-    cleanup_rows=$(jq -r --slurpfile config "$CONFIG_FILE" '
-        to_entries[]
+    local relay_config_json='{}'
+    [ ! -s "$CONFIG_FILE" ] || relay_config_json=$(cat "$CONFIG_FILE")
+    cleanup_rows=$(jq -nc --argjson links "$(cat "$LINKS_FILE")" --argjson config "$relay_config_json" '
+        $links | to_entries[]
         | .key as $tag
-        | [
-            $tag,
-            (.value.node_name // "__SINGBOXLITE_EMPTY__"),
-            (.value.port_hopping // "__SINGBOXLITE_EMPTY__"),
-            ((.value.listen_port // ([ $config[0].inbounds[]? | select(.tag == $tag) | .listen_port ][0] // "")) | tostring)
-          ]
-        | @tsv
-    ' "$LINKS_FILE" 2>/dev/null || true)
+        | {tag:$tag, node_name:(.value.node_name // ""), hop:(.value.port_hopping // ""),
+           port:((.value.listen_port // ([ $config.inbounds[]? | select(.tag == $tag) | .listen_port ][0] // "")) | tostring)}
+    ' 2>/dev/null) || { _error "中转元数据读取失败，已取消清空"; _txn_cleanup "$txn_dir"; _state_lock_release; return 1; }
 
-    while IFS=$'\t' read -r tag node_name hop port; do
+    while IFS= read -r row; do
+        local tag node_name hop port
+        tag=$(printf '%s' "$row" | jq -r '.tag')
+        node_name=$(printf '%s' "$row" | jq -r '.node_name')
+        hop=$(printf '%s' "$row" | jq -r '.hop')
+        port=$(printf '%s' "$row" | jq -r '.port')
         [ -z "$tag" ] && continue
-        [ "$node_name" = "__SINGBOXLITE_EMPTY__" ] && node_name=""
-        [ "$hop" = "__SINGBOXLITE_EMPTY__" ] && hop=""
         if [ -n "$node_name" ] && ! _remove_node_from_relay_yaml "$node_name" "$port"; then
             failed="true"
             break
@@ -2287,22 +2804,40 @@ _clear_all_relays() {
 
     relay_tags=$(jq -c '[
         (.route.rules[]? | select(((.outbound? // "") | startswith("relay-out-"))) | .inbound),
-        (.inbounds[]? | select((.tag? // "") | test("^(vless-reality|hysteria2|tuic|anytls|shadowsocks)-in-[0-9]+$")) | .tag)
+        (.inbounds[]? | select((.tag? // "") | test("^(vless-reality|vless-ws-tls|hysteria2|tuic|anytls|shadowsocks)-in-[0-9]+$")) | .tag)
     ] | unique' "$CONFIG_FILE" 2>/dev/null)
     [ -n "$relay_tags" ] || relay_tags='[]'
 
-    if [ "$failed" != "true" ]; then
+    if [ "$failed" != "true" ] && [ "$legacy_present" = true ]; then
         local clear_filter
         clear_filter="$relay_tags as \$relay_in | [.route.rules[]? | select(((.outbound? // \"\") | startswith(\"relay-out-\"))) | .outbound] as \$relay_out | .inbounds = [(.inbounds // [])[] | select((.tag as \$tag | (\$relay_in | index(\$tag))) == null)] | .outbounds = [(.outbounds // [])[] | select((.tag as \$tag | (\$relay_out | index(\$tag))) == null and ((.tag? // \"\") | startswith(\"relay-out-\") | not))] | .route.rules = [(.route.rules // [])[] | select((.inbound as \$tag | (\$relay_in | index(\$tag))) == null and (((.outbound? // \"\") | startswith(\"relay-out-\")) | not))]"
         _atomic_modify_json "$CONFIG_FILE" "$clear_filter" || failed="true"
-        _atomic_modify_json "$LINKS_FILE" '{}' || failed="true"
+    fi
+    [ "$failed" = "true" ] || _atomic_modify_json "$LINKS_FILE" '{}' || failed="true"
+    if [ "$failed" != "true" ] && [ -n "$xray_tags" ]; then
+        while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            _relay_xray_remove "$tag" || { failed="true"; break; }
+        done <<< "$xray_tags"
+    fi
+    if [ "$failed" != "true" ] && [ -n "$direct_tags" ]; then
+        while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            local direct_out_tag
+            direct_out_tag=$(jq -r --arg tag "$tag" '.[$tag].xray_outbound_tag // empty' "$txn_dir/links" 2>/dev/null)
+            [ -n "$direct_out_tag" ] && _relay_xray_remove_direct "$tag" "$direct_out_tag" || { failed="true"; break; }
+        done <<< "$direct_tags"
     fi
 
-    if [ "$failed" = "true" ] || ! _restart_checked; then
+    if [ "$failed" = "true" ] \
+        || { [ "$legacy_present" = true ] && ! _restart_checked; } \
+        || { [ "$xray_present" = true ] && ! _relay_xray_restart_checked; }; then
         _txn_restore_file "$txn_dir" relay "$CONFIG_FILE"
         _txn_restore_file "$txn_dir" links "$LINKS_FILE"
         _txn_restore_file "$txn_dir" clash "$RELAY_CLASH_YAML"
-        _manage_service restart >/dev/null 2>&1 || true
+        [ "$xray_present" = true ] && _txn_restore_file "$txn_dir" xray "$RELAY_XRAY_CONFIG"
+        [ "$legacy_present" = true ] && _manage_service restart >/dev/null 2>&1 || true
+        [ "$xray_present" = true ] && _relay_xray_service restart >/dev/null 2>&1 || true
         _txn_cleanup "$txn_dir"
         _state_lock_release
         _error "清空中转失败，已恢复原配置"
@@ -2310,10 +2845,13 @@ _clear_all_relays() {
     fi
 
     # 服务已接受新配置后，再精确删除中转自己的证书与 HY2 跳跃规则。
-    while IFS=$'\t' read -r tag node_name hop port; do
+    while IFS= read -r row; do
+        local tag node_name hop port
+        tag=$(printf '%s' "$row" | jq -r '.tag')
+        node_name=$(printf '%s' "$row" | jq -r '.node_name')
+        hop=$(printf '%s' "$row" | jq -r '.hop')
+        port=$(printf '%s' "$row" | jq -r '.port')
         [ -z "$tag" ] && continue
-        [ "$node_name" = "__SINGBOXLITE_EMPTY__" ] && node_name=""
-        [ "$hop" = "__SINGBOXLITE_EMPTY__" ] && hop=""
         rm -f -- "${RELAY_AUX_DIR}/${tag}.pem" "${RELAY_AUX_DIR}/${tag}.key"
         if [[ "$hop" =~ ^([0-9]+)-([0-9]+)$ ]]; then
             _nft_apply_redirect_rule delete "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "$port" "singboxlite-relay-hop-${tag}"
@@ -2323,27 +2861,60 @@ _clear_all_relays() {
         [ -n "$tag" ] || continue
         rm -f -- "${RELAY_AUX_DIR}/${tag}.pem" "${RELAY_AUX_DIR}/${tag}.key"
     done < <(printf '%s' "$relay_tags" | jq -r '.[]' 2>/dev/null)
-    _save_nftables_rules
+    [ "$legacy_present" != true ] || _save_nftables_rules
     _txn_cleanup "$txn_dir"
     _state_lock_release
-    _success "全部中转已清空；主节点、Xray 与端口转发配置均已保留"
+    _success "全部中转已清空；主节点、其他 Xray 节点与端口转发配置均已保留"
+}
+
+_delete_xray_direct_relay() {
+    local tag="$1" links_file="${RELAY_AUX_DIR}/relay_links.json" name port outbound_tag txn_dir failed=false
+    _relay_xray_ready && _init_xray_relay_state || return 1
+    name=$(jq -r --arg tag "$tag" '.[$tag].node_name // empty' "$links_file")
+    port=$(jq -r --arg tag "$tag" '.[$tag].listen_port // empty' "$links_file")
+    outbound_tag=$(jq -r --arg tag "$tag" '.[$tag].xray_outbound_tag // empty' "$links_file")
+    if ! _valid_port "$port" || [ -z "$name" ] || [ -z "$outbound_tag" ]; then
+        _error "Xray 中转元数据不完整，已取消删除"
+        return 1
+    fi
+    _state_lock_acquire || return 1
+    txn_dir=$(_txn_begin) || { _state_lock_release; return 1; }
+    if ! _txn_snapshot_file "$txn_dir" xray "$RELAY_XRAY_CONFIG" \
+        || ! _txn_snapshot_file "$txn_dir" links "$links_file" \
+        || ! _txn_snapshot_file "$txn_dir" clash "$RELAY_CLASH_YAML"; then
+        _txn_cleanup "$txn_dir"; _state_lock_release; return 1
+    fi
+    _remove_node_from_relay_yaml "$name" "$port" || failed=true
+    [ "$failed" = true ] || _relay_xray_remove_direct "$tag" "$outbound_tag" || failed=true
+    [ "$failed" = true ] || _atomic_modify_json "$links_file" "del(.\"$tag\")" || failed=true
+    [ "$failed" = true ] || _relay_xray_restart_checked || failed=true
+    if [ "$failed" = true ]; then
+        _txn_restore_file "$txn_dir" xray "$RELAY_XRAY_CONFIG"
+        _txn_restore_file "$txn_dir" links "$links_file"
+        _txn_restore_file "$txn_dir" clash "$RELAY_CLASH_YAML"
+        _relay_xray_service restart >/dev/null 2>&1 || true
+        _txn_cleanup "$txn_dir"; _state_lock_release
+        _error "删除 Xray 中转失败，已恢复原配置"
+        return 1
+    fi
+    _txn_cleanup "$txn_dir"; _state_lock_release
+    rm -f -- "${RELAY_AUX_DIR}/${tag}.pem" "${RELAY_AUX_DIR}/${tag}.key"
+    _success "已删除 Xray 中转链路 [$tag]"
 }
 
 _delete_relay() {
     echo -e "\n  ${RED}【删除中转路由】${NC}"
     
     local CONFIG_FILE="$RELAY_CONFIG_FILE"
-    if [ ! -f "$CONFIG_FILE" ]; then _error "配置文件不存在。"; return; fi
-    
-    local rules=$(jq -c '.route.rules[] | select(.inbound != null and .outbound != null and (.outbound | startswith("relay-out-")))' "$CONFIG_FILE" 2>/dev/null)
-    
-    if [ -z "$rules" ]; then
+    local LINKS_FILE="${RELAY_AUX_DIR}/relay_links.json"
+    local rules xray_rows
+    rules=$(jq -c '.route.rules[]? | select(.inbound != null and .outbound != null and (.outbound | startswith("relay-out-")))' "$CONFIG_FILE" 2>/dev/null)
+    xray_rows=$(jq -c 'to_entries[]? | select(.value.engine == "xray" and .value.xray_outbound_tag != null)' "$LINKS_FILE" 2>/dev/null)
+    if [ -z "$rules" ] && [ -z "$xray_rows" ]; then
         echo -e "    ${YELLOW}暂无活跃中转链路${NC}"
-        read -p "  按回车键继续..."
+        _menu_pause
         return
     fi
-    
-    local LINKS_FILE="${RELAY_AUX_DIR}/relay_links.json"
     local i=1
     local rules_list=()
     
@@ -2369,6 +2940,16 @@ _delete_relay() {
         rules_list+=("$rule")
         ((i++))
     done <<< "$rules"
+    while IFS= read -r row; do
+        [ -n "$row" ] || continue
+        local direct_tag direct_name direct_landing
+        direct_tag=$(printf '%s' "$row" | jq -r '.key')
+        direct_name=$(printf '%s' "$row" | jq -r '.value.node_name // .key')
+        direct_landing=$(printf '%s' "$row" | jq -r '.value.landing_addr // "未知"')
+        echo -e "  ${GREEN}[$i]${NC} ${YELLOW}${direct_name}${NC} (${direct_landing}, Xray)"
+        rules_list+=("$(jq -nc --arg tag "$direct_tag" '{xray_direct_tag:$tag}')")
+        ((i++))
+    done <<< "$xray_rows"
     
     echo ""
     echo -e "    ${YELLOW}[0]${NC} 取消"
@@ -2377,7 +2958,7 @@ _delete_relay() {
     read -p "  请输入要删除的序号 [1-$((i-1))]: " choice
     
     # 处理 "0" 或空输入
-    if [[ "$choice" == "0" || -z "$choice" ]]; then return; fi
+    if [[ "$choice" == "0" || -z "$choice" ]]; then _menu_skip_pause; return; fi
     
     # 处理全部删除
     if [[ "$choice" == "A" || "$choice" == "a" ]]; then
@@ -2386,6 +2967,8 @@ _delete_relay() {
         if [[ "$confirm_all" == "yes" ]]; then
             _info "正在批量删除中转自有对象..."
             _clear_all_relays
+        else
+            _menu_skip_pause
         fi
         return
     fi
@@ -2397,10 +2980,24 @@ _delete_relay() {
     fi
     
     local selected_rule="${rules_list[$((choice-1))]}"
+    local direct_tag
+    direct_tag=$(printf '%s' "$selected_rule" | jq -r '.xray_direct_tag // empty')
+    if [ -n "$direct_tag" ]; then
+        _delete_xray_direct_relay "$direct_tag"
+        return $?
+    fi
+    _require_relay_core || return 1
     local in_tag out_tag relay_port
     in_tag=$(echo "$selected_rule" | jq -r '.inbound')
     out_tag=$(echo "$selected_rule" | jq -r '.outbound')
     relay_port=$(jq -r --arg tag "$in_tag" '.inbounds[]? | select(.tag == $tag) | .listen_port' "$CONFIG_FILE" | head -n 1)
+    local is_xhttp="false"
+    if [ -f "$LINKS_FILE" ] && [ "$(jq -r --arg tag "$in_tag" '.[$tag].relay_type // empty' "$LINKS_FILE")" = "vless-xhttp-reality" ]; then
+        is_xhttp="true"
+        relay_port=$(jq -r --arg tag "$in_tag" '.[$tag].listen_port // empty' "$LINKS_FILE")
+        _relay_xray_ready || return 1
+        jq -e --arg tag "$in_tag" '.inbounds[]? | select(.tag == $tag)' "$RELAY_XRAY_CONFIG" >/dev/null 2>&1 || { _error "Xray 入口配置缺失，已取消删除"; return 1; }
+    fi
     if ! _valid_port "$relay_port"; then
         _error "无法确认该中转入口端口，已取消删除以避免误操作"
         return 1
@@ -2418,7 +3015,8 @@ _delete_relay() {
     txn_dir=$(_txn_begin) || { _state_lock_release; return 1; }
     if ! _txn_snapshot_file "$txn_dir" relay "$CONFIG_FILE" \
         || ! _txn_snapshot_file "$txn_dir" links "$LINKS_FILE" \
-        || ! _txn_snapshot_file "$txn_dir" clash "$RELAY_CLASH_YAML"; then
+        || ! _txn_snapshot_file "$txn_dir" clash "$RELAY_CLASH_YAML" \
+        || ! { [ "$is_xhttp" != "true" ] || _txn_snapshot_file "$txn_dir" xray "$RELAY_XRAY_CONFIG"; }; then
         _txn_cleanup "$txn_dir"
         _state_lock_release
         _error "无法创建删除前快照"
@@ -2433,12 +3031,17 @@ _delete_relay() {
     if [ "$failed" != "true" ] && [ -f "$LINKS_FILE" ]; then
         _atomic_modify_json "$LINKS_FILE" "del(.\"$in_tag\")" || failed="true"
     fi
+    if [ "$failed" != "true" ] && [ "$is_xhttp" = "true" ]; then
+        _relay_xray_remove "$in_tag" || failed="true"
+    fi
 
-    if [ "$failed" = "true" ] || ! _restart_checked; then
+    if [ "$failed" = "true" ] || ! _restart_checked || { [ "$is_xhttp" = "true" ] && ! _relay_xray_restart_checked; }; then
         _txn_restore_file "$txn_dir" relay "$CONFIG_FILE"
         _txn_restore_file "$txn_dir" links "$LINKS_FILE"
         _txn_restore_file "$txn_dir" clash "$RELAY_CLASH_YAML"
+        [ "$is_xhttp" = "true" ] && _txn_restore_file "$txn_dir" xray "$RELAY_XRAY_CONFIG"
         _manage_service restart >/dev/null 2>&1 || true
+        [ "$is_xhttp" = "true" ] && _relay_xray_service restart >/dev/null 2>&1 || true
         _txn_cleanup "$txn_dir"
         _state_lock_release
         _error "删除失败，已恢复原配置"
@@ -2457,13 +3060,72 @@ _delete_relay() {
 }
 
 # --- 5. 修改中转路由端口 (功能恢复) ---
+_modify_xray_direct_port() {
+    local tag="$1" new_port="$2" links_file="${RELAY_AUX_DIR}/relay_links.json"
+    local old_port name old_link new_link txn_dir tmp payload failed=false network=tcp
+    _relay_xray_ready && _init_xray_relay_state || return 1
+    old_port=$(jq -r --arg tag "$tag" '.[$tag].listen_port // empty' "$links_file")
+    name=$(jq -r --arg tag "$tag" '.[$tag].node_name // empty' "$links_file")
+    old_link=$(jq -r --arg tag "$tag" '.[$tag].link // empty' "$links_file")
+    [ "$(jq -r --arg tag "$tag" '.[$tag].relay_type // empty' "$links_file")" != shadowsocks ] || network=tcp+udp
+    _valid_port "$old_port" && _valid_port "$new_port" && [ -n "$name" ] || return 1
+    [ "$old_port" != "$new_port" ] || { _info "端口未变化"; return 0; }
+    _network_port_conflict "$new_port" "$network" "$tag" && { _error "端口 $new_port 已占用"; return 1; }
+    new_link=$(printf '%s' "$old_link" | sed -E "s/(:${old_port})([?&#\/]|$)/:${new_port}\2/g")
+    _state_lock_acquire || return 1
+    txn_dir=$(_txn_begin) || { _state_lock_release; return 1; }
+    if ! _txn_snapshot_file "$txn_dir" xray "$RELAY_XRAY_CONFIG" \
+        || ! _txn_snapshot_file "$txn_dir" links "$links_file" \
+        || ! _txn_snapshot_file "$txn_dir" clash "$RELAY_CLASH_YAML"; then
+        _txn_cleanup "$txn_dir"; _state_lock_release; return 1
+    fi
+    if _network_port_conflict "$new_port" "$network" "$tag" \
+        || ! jq -e --arg tag "$tag" 'any(.inbounds[]?; .tag == $tag)' "$RELAY_XRAY_CONFIG" >/dev/null 2>&1; then
+        _error "提交前入口端口冲突或 Xray 入口已丢失"
+        failed=true
+    fi
+    if [ "$failed" = false ]; then
+        payload=$(jq --arg tag "$tag" --argjson port "$new_port" \
+            '(.inbounds[] | select(.tag == $tag) | .port) = $port' "$RELAY_XRAY_CONFIG") || failed=true
+        [ "$failed" = true ] || _atomic_write_json "$RELAY_XRAY_CONFIG" "$payload" || failed=true
+    fi
+    if [ "$failed" = false ]; then
+        tmp=$(_make_same_dir_tmp "$links_file") || failed=true
+        if [ "$failed" = false ]; then
+            jq --arg tag "$tag" --arg link "$new_link" --argjson port "$new_port" \
+                '.[$tag].listen_port=$port | .[$tag].link=$link' "$links_file" > "$tmp" \
+                && chmod 600 "$tmp" && mv -f "$tmp" "$links_file" || failed=true
+        fi
+    fi
+    if [ "$failed" = false ]; then
+        export OLD_RELAY_NAME="$name" OLD_RELAY_PORT="$old_port" NEW_RELAY_PORT="$new_port"
+        _atomic_modify_yaml "$RELAY_CLASH_YAML" \
+            '(.proxies[] | select(.name == strenv(OLD_RELAY_NAME) and .port == (env(OLD_RELAY_PORT) | tonumber)) | .port) = (env(NEW_RELAY_PORT) | tonumber)' || failed=true
+    fi
+    [ "$failed" = true ] || _relay_xray_restart_checked || failed=true
+    if [ "$failed" = true ]; then
+        [ -z "$tmp" ] || rm -f -- "$tmp"
+        _txn_restore_file "$txn_dir" xray "$RELAY_XRAY_CONFIG"
+        _txn_restore_file "$txn_dir" links "$links_file"
+        _txn_restore_file "$txn_dir" clash "$RELAY_CLASH_YAML"
+        _relay_xray_service restart >/dev/null 2>&1 || true
+        _txn_cleanup "$txn_dir"; _state_lock_release
+        _error "Xray 中转端口修改失败，已恢复原配置"
+        return 1
+    fi
+    _txn_cleanup "$txn_dir"; _state_lock_release
+    _success "Xray 中转入口端口已改为 $new_port"
+}
+
 _modify_relay_port() {
     echo -e "\n  ${CYAN}【修改中转路由端口】${NC}"
     
     local CONFIG_FILE="$RELAY_CONFIG_FILE"
     local rules=$(jq -c '.route.rules[]? | select(.inbound != null and .outbound != null and ((.outbound | type) == "string") and (.outbound | startswith("relay-out-")))' "$CONFIG_FILE" 2>/dev/null)
+    local xray_rows
+    xray_rows=$(jq -c 'to_entries[]? | select(.value.engine == "xray" and .value.xray_outbound_tag != null)' "${RELAY_AUX_DIR}/relay_links.json" 2>/dev/null)
     
-    if [ -z "$rules" ]; then
+    if [ -z "$rules" ] && [ -z "$xray_rows" ]; then
         _warn "没有可修改的中转路由。"
         return
     fi
@@ -2473,22 +3135,59 @@ _modify_relay_port() {
         local in_tag=$(echo "$rule" | jq -r '.inbound')
         local inbound=$(jq -c --arg t "$in_tag" '.inbounds[] | select(.tag == $t)' "$CONFIG_FILE")
         local port=$(echo "$inbound" | jq -r '.listen_port')
+        if [ -f "${RELAY_AUX_DIR}/relay_links.json" ]; then
+            local public_port
+            public_port=$(jq -r --arg t "$in_tag" '.[$t] | select(.relay_type == "vless-xhttp-reality") | .listen_port // empty' "${RELAY_AUX_DIR}/relay_links.json" 2>/dev/null)
+            [ -z "$public_port" ] || port="$public_port"
+        fi
         echo -e "    ${GREEN}[$i]${NC} 端口: ${port} [${in_tag}]"
         rule_list+=("$rule")
         ((i++))
     done <<< "$rules"
+    while IFS= read -r row; do
+        [ -n "$row" ] || continue
+        local direct_tag direct_port
+        direct_tag=$(printf '%s' "$row" | jq -r '.key')
+        direct_port=$(printf '%s' "$row" | jq -r '.value.listen_port')
+        echo -e "    ${GREEN}[$i]${NC} 端口: ${direct_port} [${direct_tag}, Xray]"
+        rule_list+=("$(jq -nc --arg tag "$direct_tag" '{xray_direct_tag:$tag}')")
+        ((i++))
+    done <<< "$xray_rows"
     
     echo ""
     read -p "  请输入要修改端口的序号: " choice
-    if ! [[ "$choice" =~ ^[1-9][0-9]*$ ]] || [ "$choice" -ge "$i" ]; then return; fi
+    if ! [[ "$choice" =~ ^[1-9][0-9]*$ ]] || [ "$choice" -ge "$i" ]; then
+        if [ "$choice" = 0 ] || [ -z "$choice" ]; then
+            _menu_skip_pause
+        else
+            _error "无效序号"
+        fi
+        return
+    fi
     
     local selected_rule=${rule_list[$((choice-1))]}
+    local direct_tag
+    direct_tag=$(printf '%s' "$selected_rule" | jq -r '.xray_direct_tag // empty')
+    if [ -n "$direct_tag" ]; then
+        local direct_new_port
+        read -p "  请输入新的端口号: " direct_new_port
+        if ! _valid_port "$direct_new_port"; then _error "无效端口"; return 1; fi
+        _modify_xray_direct_port "$direct_tag" "$direct_new_port"
+        return $?
+    fi
+    _require_relay_core || return 1
     local in_tag=$(echo "$selected_rule" | jq -r '.inbound')
     local old_port=$(jq -r --arg t "$in_tag" '.inbounds[] | select(.tag == $t) | .listen_port' "$CONFIG_FILE")
     local inbound_type listen_network="tcp"
     inbound_type=$(jq -r --arg t "$in_tag" '.inbounds[] | select(.tag == $t) | .type' "$CONFIG_FILE")
     [[ "$inbound_type" == "hysteria2" || "$inbound_type" == "tuic" ]] && listen_network="udp"
     local LINKS_FILE="${RELAY_AUX_DIR}/relay_links.json"
+    local is_xhttp="false"
+    if [ -f "$LINKS_FILE" ] && [ "$(jq -r --arg t "$in_tag" '.[$t].relay_type // empty' "$LINKS_FILE")" = "vless-xhttp-reality" ]; then
+        is_xhttp="true"
+        old_port=$(jq -r --arg t "$in_tag" '.[$t].listen_port // empty' "$LINKS_FILE")
+        _valid_port "$old_port" && _relay_xray_ready || return 1
+    fi
     
     while true; do
         read -p "  请输入新的端口号: " new_port
@@ -2533,7 +3232,8 @@ _modify_relay_port() {
     txn_dir=$(_txn_begin) || { _state_lock_release; return 1; }
     if ! _txn_snapshot_file "$txn_dir" relay "$CONFIG_FILE" \
         || ! _txn_snapshot_file "$txn_dir" links "$LINKS_FILE" \
-        || ! _txn_snapshot_file "$txn_dir" clash "$RELAY_CLASH_YAML"; then
+        || ! _txn_snapshot_file "$txn_dir" clash "$RELAY_CLASH_YAML" \
+        || ! { [ "$is_xhttp" != "true" ] || _txn_snapshot_file "$txn_dir" xray "$RELAY_XRAY_CONFIG"; }; then
         _txn_cleanup "$txn_dir"
         _state_lock_release
         _error "无法创建修改前快照"
@@ -2545,7 +3245,13 @@ _modify_relay_port() {
         _error "提交前发现 ${listen_network^^} 端口 ${new_port} 已被占用"
     fi
     if [ "$failed" != "true" ]; then
-        _atomic_modify_json "$CONFIG_FILE" "(.inbounds[] | select(.tag == \"$in_tag\") | .listen_port) = ($new_port|tonumber)" || failed="true"
+        if [ "$is_xhttp" = "true" ]; then
+            local xray_payload
+            xray_payload=$(jq --arg tag "$in_tag" --argjson port "$new_port" '(.inbounds[] | select(.tag == $tag) | .port) = $port' "$RELAY_XRAY_CONFIG") || failed="true"
+            [ "$failed" = "true" ] || _atomic_write_json "$RELAY_XRAY_CONFIG" "$xray_payload" || failed="true"
+        else
+            _atomic_modify_json "$CONFIG_FILE" "(.inbounds[] | select(.tag == \"$in_tag\") | .listen_port) = ($new_port|tonumber)" || failed="true"
+        fi
     fi
     if [ "$failed" != "true" ] && [ -f "$LINKS_FILE" ]; then
         tmp=$(_make_same_dir_tmp "$LINKS_FILE") || failed="true"
@@ -2566,11 +3272,15 @@ _modify_relay_port() {
             '(.proxies[] | select(.name == strenv(OLD_RELAY_NAME) and .port == (env(OLD_RELAY_PORT) | tonumber)) | .port) = (env(NEW_RELAY_PORT) | tonumber)' || failed="true"
     fi
 
-    if [ "$failed" = "true" ] || ! _restart_checked; then
+    if [ "$failed" = "true" ] || { [ "$is_xhttp" = "true" ] && ! _check_combined_config; } \
+        || { [ "$is_xhttp" != "true" ] && ! _restart_checked; } \
+        || { [ "$is_xhttp" = "true" ] && ! _relay_xray_restart_checked; }; then
         _txn_restore_file "$txn_dir" relay "$CONFIG_FILE"
         _txn_restore_file "$txn_dir" links "$LINKS_FILE"
         _txn_restore_file "$txn_dir" clash "$RELAY_CLASH_YAML"
+        [ "$is_xhttp" = "true" ] && _txn_restore_file "$txn_dir" xray "$RELAY_XRAY_CONFIG"
         _manage_service restart >/dev/null 2>&1 || true
+        [ "$is_xhttp" = "true" ] && _relay_xray_service restart >/dev/null 2>&1 || true
         _txn_cleanup "$txn_dir"
         _state_lock_release
         _error "端口修改失败，已恢复原配置"
@@ -2599,7 +3309,7 @@ _modify_relay_port() {
     _state_lock_release
     _log_operation "MODIFY_RELAY_PORT" "Tag: $in_tag, Old Port: $old_port, New Port: $new_port"
     _success "中转端口已修改并通过组合配置校验"
-    read -p "  按回车键继续..."
+    _menu_pause
 }
 
 
@@ -2712,18 +3422,28 @@ _pf_find_hy2_hop_conflict() {
     return 1
 }
 
-_pf_can_write_nft_rules() {
-    local comment="singboxlite-pf-test-$$"
-    command -v nft &>/dev/null || return 1
-    _nft_ensure_base || return 1
-    nft add rule inet "$NFT_TABLE" prerouting tcp dport 65535 dnat ip to 127.0.0.1:65535 comment "$comment" >/dev/null 2>&1 || return 1
-    _nft_delete_rules_by_comment "$comment"
-}
+_pf_can_write_nft_rules() (
+    # 在独立临时表内探测权限，避免仅进入菜单就创建正式的转发表和链。
+    local test_table="sbl_pf_probe_${BASHPID}"
+    command -v nft >/dev/null 2>&1 || exit 1
+    nft add table inet "$test_table" >/dev/null 2>&1 || exit 1
+    trap 'nft delete table inet "$test_table" >/dev/null 2>&1' EXIT
+    nft add chain inet "$test_table" prerouting '{ type nat hook prerouting priority -110; policy accept; }' >/dev/null 2>&1 || exit 1
+    nft add rule inet "$test_table" prerouting meta mark 0x53424c54 tcp dport 65535 dnat ip to 127.0.0.1:65535 >/dev/null 2>&1
+)
 
 # 确保元数据文件存在
 _pf_ensure_metadata() {
     [ -f "$PF_METADATA_FILE" ] || _atomic_write_json "$PF_METADATA_FILE" '{}' || return 1
     _secure_state_file "$PF_METADATA_FILE"
+}
+
+_init_pf_state() {
+    local rc=0
+    _state_lock_acquire || return 1
+    _pf_ensure_metadata || rc=1
+    _state_lock_release
+    return "$rc"
 }
 
 # 统计端口转发规则数量 (基于元数据)
@@ -2734,26 +3454,25 @@ _pf_count() {
 
 # 启用内核 IP 转发 (nftables DNAT 的前提条件)
 _pf_enable_forwarding() {
-    # IPv4 转发
-    if [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" != "1" ]; then
-        echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null
-        if ! grep -q "^net.ipv4.ip_forward" /etc/sysctl.conf 2>/dev/null; then
-            echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-        else
-            sed -i 's/^net.ipv4.ip_forward.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
-        fi
-        _info "已启用 IPv4 转发 (ip_forward=1)"
+    local family="${1:-ipv4}" setting key
+    if [ "$family" = "ipv6" ]; then
+        setting=/proc/sys/net/ipv6/conf/all/forwarding
+        key=net.ipv6.conf.all.forwarding
+    else
+        setting=/proc/sys/net/ipv4/ip_forward
+        key=net.ipv4.ip_forward
     fi
-    # IPv6 转发
-    if [ -f /proc/sys/net/ipv6/conf/all/forwarding ]; then
-        if [ "$(cat /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null)" != "1" ]; then
-            echo 1 > /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null
-            if ! grep -q "^net.ipv6.conf.all.forwarding" /etc/sysctl.conf 2>/dev/null; then
-                echo "net.ipv6.conf.all.forwarding=1" >> /etc/sysctl.conf
-            else
-                sed -i 's/^net.ipv6.conf.all.forwarding.*/net.ipv6.conf.all.forwarding=1/' /etc/sysctl.conf
-            fi
+    if [ "$(cat "$setting" 2>/dev/null)" != "1" ]; then
+        if ! (printf '1\n' > "$setting") 2>/dev/null || [ "$(cat "$setting" 2>/dev/null)" != "1" ]; then
+            _error "无法启用 ${family} 内核转发；当前 nftables 转发不可用"
+            return 1
         fi
+        if ! grep -q "^${key}=" /etc/sysctl.conf 2>/dev/null; then
+            printf '%s=1\n' "$key" >> /etc/sysctl.conf || return 1
+        else
+            sed -i "s/^${key}=.*/${key}=1/" /etc/sysctl.conf || return 1
+        fi
+        _info "已启用 ${family} 内核转发"
     fi
 }
 
@@ -2766,7 +3485,10 @@ _pf_view() {
     
     local count=$(_pf_count)
     if [ "$count" -eq 0 ]; then
-        _warn "暂无转发规则"; read -p "  按回车继续..."; return
+        _warn "暂无转发规则"; _menu_pause; return
+    fi
+    if [ ! -x "$SINGBOX_BIN" ] && jq -e 'any(.[]; .engine == "singbox")' "$PF_METADATA_FILE" >/dev/null 2>&1; then
+        _warn "列表中有 sing-box 用户态规则，但核心未安装；这些规则当前无法运行。"
     fi
     
     local i=1
@@ -2785,7 +3507,7 @@ _pf_view() {
     echo ""
     echo -e "  共 ${GREEN}${count}${NC} 条转发规则"
     echo ""
-    read -p "  按回车继续..."
+    _menu_pause
 }
 
 # 安装/卸载 DNS 定时刷新 cron 任务
@@ -2812,6 +3534,21 @@ _pf_remove_dns_cron() {
 }
 
 # 端口转发子菜单
+_pf_require_singbox() {
+    if [ ! -x "$SINGBOX_BIN" ]; then
+        _error "此操作需要 sing-box 用户态转发；请先在主菜单 [15] 安装 sing-box 核心。"
+        return 1
+    fi
+    if [ ! -s "$MAIN_CONFIG_FILE" ] || [ ! -s "$RELAY_CONFIG_FILE" ]; then
+        if [ "$STATE_LOCK_OWNED" = "true" ]; then
+            _error "sing-box 配置尚未初始化；请先在主菜单 [15] 完成安装。"
+            return 1
+        fi
+        _install_yq && _init_relay_dirs || return 1
+    fi
+    return 0
+}
+
 _pf_detect_engine() {
     PF_ENGINE="singbox"
     PF_ENV_KIND="unknown"
@@ -3113,6 +3850,9 @@ _pf_guess_target_family() {
 _pf_add() {
     echo ""
     _pf_detect_engine
+    if [ "$PF_ENGINE" = "singbox" ]; then
+        _pf_require_singbox || { _menu_pause; return 1; }
+    fi
     _pf_ensure_metadata
 
     if [ "$PF_ENGINE" == "nftables" ]; then
@@ -3140,13 +3880,13 @@ _pf_add() {
     local target_addr
     read -p "  请输入目标地址 (IP 或域名): " target_addr
     if [ -z "$target_addr" ]; then
-        _error "目标地址不能为空"; read -p "  按回车继续..."; return
+        _error "目标地址不能为空"; _menu_pause; return
     fi
 
     local target_port
     read -p "  请输入目标端口: " target_port
     if [[ ! "$target_port" =~ ^[0-9]+$ ]] || [ "$target_port" -lt 1 ] || [ "$target_port" -gt 65535 ]; then
-        _error "无效端口"; read -p "  按回车继续..."; return
+        _error "无效端口"; _menu_pause; return
     fi
 
     echo ""
@@ -3172,7 +3912,7 @@ _pf_add() {
 
     if _network_port_conflict "$listen_port" "$network"; then
         _error "${network_display} 端口 ${listen_port} 已被系统或已有配置占用"
-        read -p "  按回车继续..."
+        _menu_pause
         return
     fi
 
@@ -3184,7 +3924,7 @@ _pf_add() {
             IFS=$'\t' read -r c_tag c_name c_range c_mode <<< "$hop_conflict"
             _error "UDP 转发入口端口 ${listen_port} 落在已有 HY2 端口跳跃范围 ${c_range} 内。"
             _error "冲突节点: ${c_name} (${c_tag}, ${c_mode})。请换端口或先调整该 HY2 跳跃范围。"
-            read -p "  按回车继续..."; return
+            _menu_pause; return
         fi
     fi
 
@@ -3222,25 +3962,38 @@ _pf_add() {
             _error "目标地址无法解析为可用的 IPv4/IPv6，无法创建 nftables 转发规则"
             _txn_cleanup "$txn_dir"
             _state_lock_release
-            read -p "  按回车继续..."; return
+            _menu_pause; return
         fi
         IFS=$'\t' read -r target_family resolved_ip target_is_domain <<< "$resolved_payload"
         [ "$target_is_domain" == "true" ] && _success "域名已解析: $target_addr -> $resolved_ip (${target_family})"
-        _pf_enable_forwarding
-        if ! _pf_apply_nft_rules "add" "$listen_port" "$resolved_ip" "$target_port" "$network" "$target_family"; then
-            _error "nftables 规则写入失败"
+        if ! _pf_enable_forwarding "$target_family" \
+            || ! _pf_apply_nft_rules "add" "$listen_port" "$resolved_ip" "$target_port" "$network" "$target_family"; then
+            _warn "内核转发准备或规则写入失败，尝试 sing-box 用户态转发。"
+            if ! _pf_require_singbox; then
+                _txn_cleanup "$txn_dir"
+                _state_lock_release
+                _menu_pause; return 1
+            fi
+            PF_ENGINE="singbox"
+            PF_ACCESS_HINT="nftables 提交失败，已改用 sing-box 用户态转发。"
+            target_family="" resolved_ip="" target_is_domain="false"
+        elif ! _save_nftables_rules; then
+            _pf_apply_nft_rules "delete" "$listen_port" "$resolved_ip" "$target_port" "$network" "$target_family" >/dev/null 2>&1 || true
             _txn_cleanup "$txn_dir"
             _state_lock_release
-            read -p "  按回车继续..."; return
+            _error "nftables 规则无法持久化，已撤销本次创建"
+            _menu_pause; return 1
+        else
+            apply_ok="true"
         fi
-        _save_nftables_rules
-        apply_ok="true"
-    else
+    fi
+    if [ "$PF_ENGINE" == "singbox" ]; then
         if ! _pf_apply_singbox_rules "add" "$listen_port" "$target_addr" "$target_port" "$network"; then
             _error "配置写入失败"
+            _txn_restore_file "$txn_dir" relay "$RELAY_CONFIG_FILE"
             _txn_cleanup "$txn_dir"
             _state_lock_release
-            read -p "  按回车继续..."; return
+            _menu_pause; return
         fi
         if _restart_checked; then
             apply_ok="true"
@@ -3259,7 +4012,7 @@ _pf_add() {
         _txn_cleanup "$txn_dir"
         _state_lock_release
         _error "端口转发创建失败，已恢复原配置"
-        read -p "  按回车继续..."
+        _menu_pause
         return 1
     fi
     _txn_cleanup "$txn_dir"
@@ -3276,7 +4029,7 @@ _pf_add() {
     fi
     echo ""
     _pf_auto_manage_dns_cron
-    read -p "  按回车继续..."
+    _menu_pause
 }
 
 _pf_delete() {
@@ -3287,7 +4040,7 @@ _pf_delete() {
 
     local count=$(_pf_count)
     if [ "$count" -eq 0 ]; then
-        _warn "暂无转发规则"; read -p "  按回车继续..."; return
+        _warn "暂无转发规则"; _menu_pause; return
     fi
 
     local ports=()
@@ -3302,12 +4055,15 @@ _pf_delete() {
     echo ""
     read -p "  请输入要删除的序号 (0 取消): " sel
     if [[ ! "$sel" =~ ^[0-9]+$ ]] || [ "$sel" -lt 1 ] || [ "$sel" -gt "${#ports[@]}" ]; then
-        [ "$sel" != "0" ] && _error "无效选择"
+        if [ "$sel" = 0 ]; then _menu_skip_pause; else _error "无效选择"; fi
         return
     fi
 
     local selected_port="${ports[$((sel-1))]}"
     local sel_engine=$(jq -r ".\"$selected_port\".engine" "$PF_METADATA_FILE")
+    if [ "$sel_engine" = "singbox" ]; then
+        _pf_require_singbox || { _menu_pause; return 1; }
+    fi
     local sel_addr=$(jq -r ".\"$selected_port\".target_addr" "$PF_METADATA_FILE")
     local sel_tport=$(jq -r ".\"$selected_port\".target_port" "$PF_METADATA_FILE")
     local sel_net=$(jq -r ".\"$selected_port\".network" "$PF_METADATA_FILE")
@@ -3326,9 +4082,10 @@ _pf_delete() {
         return 1
     fi
     if [ "$sel_engine" == "nftables" ]; then
-        _pf_apply_nft_rules "delete" "$selected_port" "$del_dest" "$sel_tport" "$sel_net" "$sel_family"
-        _save_nftables_rules
-        delete_ok="true"
+        if _pf_apply_nft_rules "delete" "$selected_port" "$del_dest" "$sel_tport" "$sel_net" "$sel_family" \
+            && _save_nftables_rules; then
+            delete_ok="true"
+        fi
     else
         if _pf_apply_singbox_rules "delete" "$selected_port" && _restart_checked; then
             delete_ok="true"
@@ -3355,7 +4112,7 @@ _pf_delete() {
 
     _success "已删除端口 ${selected_port} 的转发规则"
     _pf_auto_manage_dns_cron
-    read -p "  按回车继续..."
+    _menu_pause
 }
 
 _pf_modify() {
@@ -3366,7 +4123,7 @@ _pf_modify() {
 
     local count=$(_pf_count)
     if [ "$count" -eq 0 ]; then
-        _warn "暂无转发规则"; read -p "  按回车继续..."; return
+        _warn "暂无转发规则"; _menu_pause; return
     fi
 
     local ports=()
@@ -3381,12 +4138,15 @@ _pf_modify() {
     echo ""
     read -p "  请输入要修改的序号 (0 取消): " sel
     if [[ ! "$sel" =~ ^[0-9]+$ ]] || [ "$sel" -lt 1 ] || [ "$sel" -gt "${#ports[@]}" ]; then
-        [ "$sel" != "0" ] && _error "无效选择"
+        if [ "$sel" = 0 ]; then _menu_skip_pause; else _error "无效选择"; fi
         return
     fi
 
     local selected_port="${ports[$((sel-1))]}"
     local old_engine=$(jq -r ".\"$selected_port\".engine" "$PF_METADATA_FILE")
+    if [ "$old_engine" = "singbox" ]; then
+        _pf_require_singbox || { _menu_pause; return 1; }
+    fi
     local old_name=$(jq -r ".\"$selected_port\".name" "$PF_METADATA_FILE")
     local old_addr=$(jq -r ".\"$selected_port\".target_addr" "$PF_METADATA_FILE")
     local old_tport=$(jq -r ".\"$selected_port\".target_port" "$PF_METADATA_FILE")
@@ -3418,6 +4178,9 @@ _pf_modify() {
     [ "$old_net" == "tcp+udp" ] && old_net_display="TCP+UDP"
 
     _pf_detect_engine
+    if [ "$PF_ENGINE" = "singbox" ]; then
+        _pf_require_singbox || { _menu_pause; return 1; }
+    fi
     [ -n "$PF_ACCESS_HINT" ] && _info "$PF_ACCESS_HINT"
     echo ""
     echo -e "  当前协议: ${YELLOW}${old_net_display}${NC}"
@@ -3442,7 +4205,7 @@ _pf_modify() {
             IFS=$'\t' read -r c_tag c_name c_range c_mode <<< "$hop_conflict"
             _error "UDP 转发入口端口 ${selected_port} 落在已有 HY2 端口跳跃范围 ${c_range} 内。"
             _error "冲突节点: ${c_name} (${c_tag}, ${c_mode})。请换端口或先调整该 HY2 跳跃范围。"
-            read -p "  按回车继续..."; return
+            _menu_pause; return
         fi
     fi
 
@@ -3462,7 +4225,7 @@ _pf_modify() {
 
     if [ "$delete_ok" != "true" ]; then
         _error "旧规则删除失败，已取消修改"
-        read -p "  按回车继续..."; return
+        _menu_pause; return
     fi
 
     local target_family=""
@@ -3481,13 +4244,14 @@ _pf_modify() {
                 _pf_apply_singbox_rules "add" "$selected_port" "$old_addr" "$old_tport" "$old_net" >/dev/null 2>&1 && _manage_service restart >/dev/null 2>&1
             fi
             _error "修改失败，已恢复旧规则"
-            read -p "  按回车继续..."; return
+            _menu_pause; return
         fi
         IFS=$'\t' read -r target_family resolved_ip target_is_domain <<< "$resolved_payload"
         [ "$target_is_domain" == "true" ] && _success "域名已解析: $new_addr -> $resolved_ip (${target_family})"
-        if _pf_apply_nft_rules "add" "$selected_port" "$resolved_ip" "$new_tport" "$new_net" "$target_family"; then
+        if _pf_enable_forwarding "$target_family" \
+            && _pf_apply_nft_rules "add" "$selected_port" "$resolved_ip" "$new_tport" "$new_net" "$target_family" \
+            && _save_nftables_rules; then
             apply_ok="true"
-            _save_nftables_rules
         fi
     else
         if _pf_apply_singbox_rules "add" "$selected_port" "$new_addr" "$new_tport" "$new_net"; then
@@ -3508,7 +4272,7 @@ _pf_modify() {
             _pf_apply_singbox_rules "add" "$selected_port" "$old_addr" "$old_tport" "$old_net" >/dev/null 2>&1 && _manage_service restart >/dev/null 2>&1
         fi
         _error "修改失败，已恢复旧规则"
-        read -p "  按回车继续..."; return
+        _menu_pause; return
     fi
 
     if ! _pf_store_metadata "$selected_port" "$PF_ENGINE" "$new_name" "$new_addr" "$new_tport" "$new_net" "$new_net_display" "$target_family" "$resolved_ip" "$target_is_domain"; then
@@ -3526,7 +4290,7 @@ _pf_modify() {
             _manage_service restart >/dev/null 2>&1 || true
         fi
         _error "修改失败，已恢复原规则"
-        read -p "  按回车继续..."
+        _menu_pause
         return 1
     fi
 
@@ -3534,19 +4298,22 @@ _pf_modify() {
     echo -e "  【${new_name}】本机端口: ${GREEN}${selected_port}${NC} -> 目标: ${GREEN}${new_addr}:${new_tport}${NC}  [${new_net_display}]"
     [ "$PF_PUBLISH_HINT" == "true" ] && echo -e "  ${YELLOW}提示: Docker/Podman 桥接网络下，请确保宿主机已发布 ${selected_port}/${new_net}${NC}"
     _pf_auto_manage_dns_cron
-    read -p "  按回车继续..."
+    _menu_pause
 }
 
 _pf_clear() {
     local count=$(_pf_count)
     if [ "$count" -eq 0 ]; then
-        _warn "暂无转发规则"; read -p "  按回车继续..."; return
+        _warn "暂无转发规则"; _menu_pause; return
+    fi
+    if jq -e 'any(.[]; .engine == "singbox")' "$PF_METADATA_FILE" >/dev/null 2>&1; then
+        _pf_require_singbox || { _menu_pause; return 1; }
     fi
 
     echo ""
     _warn "确认清空全部 ${count} 条端口转发规则？（中转规则不受影响）"
     read -p "  (y/N): " confirm
-    if [ "$confirm" != "y" ]; then return; fi
+    if [ "$confirm" != "y" ]; then _menu_skip_pause; return; fi
 
     local need_singbox_restart=false failed="false" txn_dir
     _state_lock_acquire || return 1
@@ -3566,7 +4333,7 @@ _pf_clear() {
         fi
 
         if [ "$engine" == "nftables" ]; then
-            _pf_apply_nft_rules "delete" "$port" "$del_dest" "$tport" "$net" "$family"
+            _pf_apply_nft_rules "delete" "$port" "$del_dest" "$tport" "$net" "$family" || failed="true"
         else
             _pf_apply_singbox_rules "delete" "$port" || failed="true"
             need_singbox_restart=true
@@ -3574,7 +4341,7 @@ _pf_clear() {
     done < <(jq -r 'to_entries[] | [.key, .value.engine, .value.target_addr, (.value.target_port|tostring), .value.network, (.value.resolved_ip // "null"), (.value.target_family // "null")] | @tsv' "$PF_METADATA_FILE" 2>/dev/null)
 
     _atomic_write_json "$PF_METADATA_FILE" '{}' || failed="true"
-    _save_nftables_rules
+    _save_nftables_rules || failed="true"
     if [ "$need_singbox_restart" = true ]; then
         _restart_checked || failed="true"
     fi
@@ -3592,7 +4359,9 @@ _pf_clear() {
             _pf_apply_nft_rules "add" "$port" "$restore_dest" "$tport" "$net" "$family" >/dev/null 2>&1 || true
         done < <(jq -r 'to_entries[] | [.key, .value.engine, .value.target_addr, (.value.target_port|tostring), .value.network, (.value.resolved_ip // "null"), (.value.target_family // "null")] | @tsv' "$txn_dir/pf" 2>/dev/null)
         _save_nftables_rules
-        _manage_service restart >/dev/null 2>&1 || true
+        if [ "$need_singbox_restart" = true ]; then
+            _manage_service restart >/dev/null 2>&1 || true
+        fi
         _txn_cleanup "$txn_dir"
         _state_lock_release
         _error "清空端口转发失败，已恢复原规则"
@@ -3604,7 +4373,7 @@ _pf_clear() {
 
     _success "所有端口转发规则已清空"
     _pf_auto_manage_dns_cron
-    read -p "  按回车继续..."
+    _menu_pause
 }
 
 _pf_dns_log() {
@@ -3704,8 +4473,9 @@ _pf_switch_engine() {
 
     local count=$(_pf_count)
     if [ "$count" -eq 0 ]; then
-        _warn "暂无转发规则"; read -p "  按回车继续..."; return
+        _warn "暂无转发规则"; _menu_pause; return
     fi
+    _pf_require_singbox || { _menu_pause; return 1; }
 
     local ports=()
     local i=1
@@ -3723,7 +4493,7 @@ _pf_switch_engine() {
     echo ""
     read -p "  请输入要切换引擎的规则序号 (0 取消): " sel
     if [[ ! "$sel" =~ ^[0-9]+$ ]] || [ "$sel" -lt 1 ] || [ "$sel" -gt "${#ports[@]}" ]; then
-        [ "$sel" != "0" ] && _error "无效选择"
+        if [ "$sel" = 0 ]; then _menu_skip_pause; else _error "无效选择"; fi
         return
     fi
 
@@ -3744,7 +4514,7 @@ _pf_switch_engine() {
         echo -e "  ${YELLOW}规则: 【${cur_name}】:${selected_port} -> ${cur_addr}:${cur_tport} [${cur_net_display}]${NC}"
         echo ""
         read -p "  确认将此规则从 nftables 切换到 singbox 用户态转发？(y/N): " confirm
-        [ "$confirm" != "y" ] && return
+        [ "$confirm" != "y" ] && { _menu_skip_pause; return; }
 
         # 删除旧 nftables 规则
         [ -z "$cur_family" ] && cur_family=$(_pf_guess_target_family "$cur_del_dest")
@@ -3756,14 +4526,14 @@ _pf_switch_engine() {
             _pf_apply_nft_rules "add" "$selected_port" "$cur_del_dest" "$cur_tport" "$cur_net" "$cur_family" >/dev/null 2>&1
             _save_nftables_rules
             _error "切换失败，已恢复旧的 nftables 规则"
-            read -p "  按回车继续..."; return
+            _menu_pause; return
         fi
         if ! _restart_checked; then
             _pf_apply_singbox_rules "delete" "$selected_port" >/dev/null 2>&1
             _pf_apply_nft_rules "add" "$selected_port" "$cur_del_dest" "$cur_tport" "$cur_net" "$cur_family" >/dev/null 2>&1
             _save_nftables_rules
             _error "切换失败，已恢复旧的 nftables 规则"
-            read -p "  按回车继续..."; return
+            _menu_pause; return
         fi
 
         # 更新 metadata：引擎改为 singbox，清除 nftables 专用字段
@@ -3789,7 +4559,7 @@ _pf_switch_engine() {
         _pf_detect_engine
         if [ "$PF_ENGINE" != "nftables" ]; then
             _error "当前环境无法使用 nftables 引擎（缺少 netfilter 权限），无法切换"
-            read -p "  按回车继续..."; return
+            _menu_pause; return
         fi
 
         if [[ "$cur_net" == "udp" || "$cur_net" == "tcp+udp" ]]; then
@@ -3800,23 +4570,23 @@ _pf_switch_engine() {
                 IFS=$'\t' read -r c_tag c_name c_range c_mode <<< "$hop_conflict"
                 _error "UDP 转发入口端口 ${selected_port} 落在已有 HY2 端口跳跃范围 ${c_range} 内。"
                 _error "冲突节点: ${c_name} (${c_tag}, ${c_mode})。请换端口或先调整该 HY2 跳跃范围。"
-                read -p "  按回车继续..."; return
+                _menu_pause; return
             fi
         fi
 
         read -p "  确认将此规则从 singbox 切换到 nftables 内核转发？(y/N): " confirm
-        [ "$confirm" != "y" ] && return
+        [ "$confirm" != "y" ] && { _menu_skip_pause; return; }
 
         # 删除旧 singbox 规则
         if ! _pf_apply_singbox_rules "delete" "$selected_port"; then
             _error "旧的 singbox 规则删除失败，无法切换"
-            read -p "  按回车继续..."; return
+            _menu_pause; return
         fi
         if ! _restart_checked; then
             _pf_apply_singbox_rules "add" "$selected_port" "$cur_addr" "$cur_tport" "$cur_net" >/dev/null 2>&1
             _manage_service restart >/dev/null 2>&1
             _error "切换失败，已恢复旧的 singbox 规则"
-            read -p "  按回车继续..."; return
+            _menu_pause; return
         fi
 
         # nftables 需要解析域名拿到 IP
@@ -3829,19 +4599,25 @@ _pf_switch_engine() {
             _pf_apply_singbox_rules "add" "$selected_port" "$cur_addr" "$cur_tport" "$cur_net" >/dev/null 2>&1
             _manage_service restart >/dev/null 2>&1
             _error "目标地址无法解析为可用的 IPv4/IPv6，已恢复旧的 singbox 规则"
-            read -p "  按回车继续..."; return
+            _menu_pause; return
         fi
         IFS=$'\t' read -r new_family new_resolved new_is_domain <<< "$resolved_payload"
         [ "$new_is_domain" == "true" ] && _success "域名已解析: $cur_addr -> $new_resolved (${new_family})"
 
-        _pf_enable_forwarding
-        if ! _pf_apply_nft_rules "add" "$selected_port" "$new_resolved" "$cur_tport" "$cur_net" "$new_family"; then
+        if ! _pf_enable_forwarding "$new_family" \
+            || ! _pf_apply_nft_rules "add" "$selected_port" "$new_resolved" "$cur_tport" "$cur_net" "$new_family"; then
             _pf_apply_singbox_rules "add" "$selected_port" "$cur_addr" "$cur_tport" "$cur_net" >/dev/null 2>&1
             _manage_service restart >/dev/null 2>&1
             _error "切换失败，已恢复旧的 singbox 规则"
-            read -p "  按回车继续..."; return
+            _menu_pause; return
         fi
-        _save_nftables_rules
+        if ! _save_nftables_rules; then
+            _pf_apply_nft_rules "delete" "$selected_port" "$new_resolved" "$cur_tport" "$cur_net" "$new_family" >/dev/null 2>&1 || true
+            _pf_apply_singbox_rules "add" "$selected_port" "$cur_addr" "$cur_tport" "$cur_net" >/dev/null 2>&1 || true
+            _manage_service restart >/dev/null 2>&1 || true
+            _error "nftables 规则无法持久化，已恢复旧的 sing-box 规则"
+            _menu_pause; return 1
+        fi
 
         # 更新 metadata：引擎改为 nftables，补充 nftables 专用字段
         local updated_meta
@@ -3860,10 +4636,11 @@ _pf_switch_engine() {
     fi
 
     _pf_auto_manage_dns_cron
-    read -p "  按回车继续..."
+    _menu_pause
 }
 
 _port_forward_menu() {
+    _init_pf_state || { _error "端口转发状态初始化失败"; return 1; }
     # 进入菜单时同步修复已有 DDNS 规则的 cron 周期和脚本路径。
     _pf_auto_manage_dns_cron
     while true; do
@@ -3884,6 +4661,7 @@ _port_forward_menu() {
         echo -e "${NC}"
         
         read -p "  请输入选项 [0-6]: " pf_choice
+        RELAY_RESULT_ACKNOWLEDGED=false
         case "$pf_choice" in
             1) _pf_add ;;
             2) _pf_view ;;
@@ -3892,17 +4670,29 @@ _port_forward_menu() {
             5) _pf_switch_engine ;;
             6) _pf_clear ;;
             0) return ;;
-            *) _error "无效输入"; sleep 1 ;;
+            *) _error "无效输入" ;;
         esac
+        _menu_pause_if_needed
     done
 }
 
 
+_require_relay_core() {
+    if [ ! -x "$SINGBOX_BIN" ]; then
+        _error "中转节点功能需要 sing-box 核心。请先在主菜单 [15] 安装。"
+        return 1
+    fi
+    _install_yq && _init_relay_dirs
+}
+
+_with_relay_core() {
+    _require_relay_core || return 1
+    "$@"
+}
+
 _menu() {
     _check_root || return 1
     _check_deps || return 1
-    _install_yq || return 1
-    _init_relay_dirs || return 1
 
     while true; do
         clear
@@ -3940,8 +4730,21 @@ _menu() {
             _is_pid_file_running_cmd "$SINGBOX_PID_FILE" "$SINGBOX_BIN" && service_status="${GREEN}● 运行中${NC}"
         fi
 
+        local xray_status="${YELLOW}○ 未安装${NC}"
+        if [ -x "$RELAY_XRAY_BIN" ]; then
+            xray_status="${RED}○ 已停止${NC}"
+            if [ "$INIT_SYSTEM" = systemd ]; then
+                systemctl is-active --quiet xray && xray_status="${GREEN}● 运行中${NC}"
+            elif [ "$INIT_SYSTEM" = openrc ]; then
+                rc-service xray status 2>/dev/null | grep -q started && xray_status="${GREEN}● 运行中${NC}"
+            else
+                _is_pid_file_running_cmd "$RELAY_XRAY_PID_FILE" "$RELAY_XRAY_BIN" && xray_status="${GREEN}● 运行中${NC}"
+            fi
+        fi
+
         echo -e "  系统版本: ${CYAN}${os_info}${NC}"
         echo -e "  中转服务: ${service_status} (${service_name})"
+        echo -e "  Xray 服务: ${xray_status} (xray)"
         echo ""
         echo -e "  ${CYAN}【基础配置】${NC}"
         echo -e "    ${GREEN}[1]${NC} 落地机：生成全协议 Token"
@@ -3961,21 +4764,27 @@ _menu() {
         echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
         echo ""
         read -p "  请输入选项 [0-8]: " choice
+        RELAY_RESULT_ACKNOWLEDGED=false
         case $choice in
-            1) _landing_config ;;
-            2) _relay_config ;;
+            1) _with_relay_core _landing_config ;;
+            2) _with_relay_core _relay_config ;;
             3) _import_link_config ;;
             4) _view_relays ;;
             5) _delete_relay ;;
             6) _modify_relay_port ;;
-            7) echo ""; _warn "确认清空所有中转配置?"; read -p "  (y/N): " cn;
-               if [ "$cn" == "y" ]; then
-                   _clear_all_relays
+            7) if _init_xray_relay_state; then
+                   echo ""; _warn "确认清空所有中转配置?"; read -p "  (y/N): " cn
+                   if [ "$cn" = "y" ]; then
+                       _clear_all_relays
+                   else
+                       _menu_skip_pause
+                   fi
                fi ;;
             0) break ;;
-            8) _port_forward_menu ;;
-            *) _error "无效输入"; sleep 1 ;;
+            8) if _port_forward_menu; then _menu_skip_pause; fi ;;
+            *) _error "无效输入" ;;
         esac
+        _menu_pause_if_needed
     done
 }
 # 命令行参数解析：支持 cron 定时任务直接调用刷新函数
