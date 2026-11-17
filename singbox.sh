@@ -13,7 +13,7 @@ export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
 SELF_SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(dirname "$SELF_SCRIPT_PATH")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
-SINGBOX_FIXED_VERSION="1.13.21"
+SINGBOX_FIXED_VERSION="1.14.4"
 SINGBOX_CORE_LOCK_FILE="${SINGBOX_DIR}/core-version.lock"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/singbox.sh"
@@ -1328,7 +1328,7 @@ _install_yq() {
 # --- 核心变量定义 ---
 export SINGBOX_DIR="/usr/local/etc/sing-box"
 export SINGBOX_BIN="/usr/local/bin/sing-box"
-export SINGBOX_FIXED_VERSION="1.13.21"
+export SINGBOX_FIXED_VERSION
 export SINGBOX_CORE_LOCK_FILE="${SINGBOX_DIR}/core-version.lock"
 export YQ_BINARY="/usr/local/bin/yq"
 export CONFIG_FILE="${SINGBOX_DIR}/config.json"
@@ -5410,6 +5410,62 @@ _add_socks() {
     _show_node_link "socks" "$name" "$display_ip" "$port" "$tag" "$username" "$password" || return 1
 }
 
+_add_snell_v6() {
+    local core_version server port name tag psk inbound proxy
+    core_version=$("$SINGBOX_BIN" version 2>/dev/null | awk 'NR == 1 {print $3}')
+    if ! [[ "$core_version" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+$ ]] ||
+        ! (( BASH_REMATCH[1] > 1 || (BASH_REMATCH[1] == 1 && BASH_REMATCH[2] >= 14) )); then
+        _error "Snell v6 需要 sing-box 1.14.0 或以上的稳定版，请通过主菜单 [15] 安装。"
+        return 1
+    fi
+
+    read -r -p "请输入客户端连接地址 (默认: ${server_ip}): " server || return 1
+    server=$(_normalize_client_server "${server:-$server_ip}")
+    if ! [[ "$server" =~ ^[A-Za-z0-9._-]+$ || "$server" =~ ^[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]+$ || "$server" == "::" ]]; then
+        _error "请输入 IPv4、IPv6 或域名。"
+        return 1
+    fi
+    while true; do
+        read -r -p "请输入 TCP 监听端口: " port || return 1
+        if ! _check_port_conflict "$port" tcp; then
+            port=$((10#$port))
+            break
+        fi
+    done
+    tag="snell-in-${port}"
+    read -r -p "请输入节点名称 (默认: Snell-v6-${port}): " name || return 1
+    name="${name:-Snell-v6-${port}}"
+    psk=$("$SINGBOX_BIN" generate rand --hex 16) && [[ "$psk" =~ ^[0-9a-fA-F]{32}$ ]] || return 1
+
+    inbound=$(jq -cn --arg tag "$tag" --argjson port "$port" --arg psk "$psk" '
+        {type:"snell",tag:$tag,listen:"::",listen_port:$port,version:6,mode:"default",psk:$psk}
+    ') || return 1
+    proxy=$(jq -cn --arg name "$name" --arg server "$server" --argjson port "$port" --arg psk "$psk" '
+        {name:$name,type:"snell",server:$server,port:$port,version:6,mode:"default",psk:$psk,udp:true,reuse:false}
+    ') || return 1
+
+    _atomic_modify_json "$CONFIG_FILE" '.inbounds += [$inbound]' --argjson inbound "$inbound" || return 1
+    _add_node_to_yaml "$proxy" || return 1
+    _atomic_modify_json "$METADATA_FILE" '.[$tag] = {name:$name,owner:"singbox-main",variant:"snell-v6",clientServer:$server,yaml:true}' \
+        --arg tag "$tag" --arg name "$name" --arg server "$server" || return 1
+    _info "可在主菜单的查看节点选项中获取 Snell v6 客户端配置。"
+}
+
+_show_snell_v6_client_config() {
+    local node="$1" tag="$2" server="$3" port="$4" psk
+    [ -n "$server" ] || { _error "Snell 节点缺少客户端连接地址。"; return 1; }
+    psk=$(jq -er '.psk | select(type == "string" and length >= 12)' <<< "$node") || return 1
+    echo "  Mihomo YAML: $CLASH_YAML_FILE"
+    echo "  sing-box / v2rayN 自定义 JSON:"
+    jq -n --arg server "$server" --argjson port "$port" --arg psk "$psk" '
+        {inbounds:[{type:"mixed",listen:"127.0.0.1",listen_port:10808}],
+         outbounds:[{type:"snell",tag:"proxy",server:$server,server_port:$port,version:6,mode:"default",psk:$psk,reuse:false}],
+         route:{final:"proxy"}}
+    ' || return 1
+    echo "  Surge [Proxy]:"
+    printf '  %s = snell, %s, %s, psk=%s, version=6, mode=default, reuse=false\n' "$tag" "$server" "$port" "$psk"
+}
+
 _view_nodes() {
     local primary_nodes
     primary_nodes=$(_list_main_primary_inbounds)
@@ -5449,6 +5505,12 @@ _view_nodes() {
         echo "-------------------------------------"
         # [!] 已修改：使用 display_name
         _info " 节点: ${display_name}"
+        if [ "$type" = "snell" ] && [[ "$tag" == snell-in-* ]]; then
+            local snell_server
+            snell_server=$(jq -r --arg tag "$tag" '.[$tag].clientServer // empty' "$METADATA_FILE")
+            _show_snell_v6_client_config "$node" "$tag" "${snell_server:-$display_ip}" "$port"
+            continue
+        fi
         local url=""
         
         # [新架构] 优先使用持久化生成的链接（从极源解决动态提取可能存在的 SNI 丢失死角）
@@ -6066,6 +6128,7 @@ _detect_main_node_variant() {
         elif .type == "shadowtls" then "shadowsocks-shadowtls"
         elif .type == "shadowsocks" then "shadowsocks"
         elif .type == "socks" then "socks"
+        elif .type == "snell" and .version == 6 and (.tag | startswith("snell-in-")) then "snell-v6"
         else "unsupported"
         end
     ' "$CONFIG_FILE" 2>/dev/null | head -n 1
@@ -6156,7 +6219,7 @@ _refresh_modified_node_artifacts() {
     fi
 
     local uuid password username method sni public_key short_id cert_path key_path skip_verify
-    local path service_name obfs_password hop up down inner_tag shadow_password
+    local path service_name obfs_password hop up down inner_tag shadow_password psk
     case "$variant" in
         vless-reality)
             uuid=$(printf '%s' "$node" | jq -r '.users[0].uuid')
@@ -6276,6 +6339,11 @@ _refresh_modified_node_artifacts() {
             export NODE_METHOD="$method" NODE_PASSWORD="$password" NODE_SHADOW_PASSWORD="$shadow_password" NODE_SNI="$sni"
             _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.cipher = env(NODE_METHOD) | .password = env(NODE_PASSWORD) | .["plugin-opts"].host = env(NODE_SNI) | .["plugin-opts"].password = env(NODE_SHADOW_PASSWORD))' || return 1
             _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$method" "$password" "$shadow_password" "$sni" || return 1
+            ;;
+        snell-v6)
+            psk=$(jq -er '.psk' <<< "$node") || return 1
+            export NODE_PSK="$psk"
+            _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))).psk = env(NODE_PSK)' || return 1
             ;;
         socks)
             username=$(printf '%s' "$node" | jq -r '.users[0].username')
@@ -6948,6 +7016,9 @@ _modify_node_apply() (
                         | (.inbounds[] | select(.tag == $inner) | .password) = $inner_password
                     ' --arg tag "$tag" --arg inner "$inner_tag" --arg outer "$arg1" --arg inner_password "$arg2" || return 1
                     ;;
+                snell-v6)
+                    _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag)).psk = $psk' --arg tag "$tag" --arg psk "$arg1" || return 1
+                    ;;
                 socks)
                     _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .users[0]) |= (.username = $username | .password = $password)' --arg tag "$tag" --arg username "$arg1" --arg password "$arg2" || return 1 ;;
             esac
@@ -7162,6 +7233,7 @@ _modify_node() {
         tuic) echo "  4) 修改 UUID 和密码" ;;
         shadowsocks-shadowtls) echo "  4) 修改 ShadowTLS 与内部 SS 密码" ;;
         socks) echo "  4) 修改用户名和密码" ;;
+        snell-v6) echo "  4) 重新生成 PSK" ;;
         *) echo "  4) 修改认证信息" ;;
     esac
     case "$variant" in
@@ -7217,6 +7289,9 @@ _modify_node() {
                 shadowsocks-shadowtls)
                     read -r -s -p "请输入新 ShadowTLS 密码 (回车随机生成): " value; echo ""; value=${value:-$(${SINGBOX_BIN} generate rand --hex 16)}
                     read -r -s -p "请输入新内部 SS 密钥 (回车随机生成): " value2; echo ""; value2=${value2:-$(${SINGBOX_BIN} generate rand --base64 32)}
+                    ;;
+                snell-v6)
+                    value=$("$SINGBOX_BIN" generate rand --hex 16) && [[ "$value" =~ ^[0-9a-fA-F]{32}$ ]] || return 1
                     ;;
                 socks)
                     read -r -p "请输入新用户名 (回车随机生成): " value; value=${value:-$(${SINGBOX_BIN} generate rand --hex 8)}
@@ -7345,11 +7420,11 @@ _update_script_locked() {
         return 1
     fi
 
-    local cache_bust downloaded_version script_name script_path script_url stage backup i j
+    local cache_bust downloaded_version fixed_version script_name script_path script_url stage backup i j
     local names=("singbox.sh" "advanced_relay.sh" "parser.sh" "xray_manager.sh")
     local targets=("$SELF_SCRIPT_PATH")
     local urls=()
-    local stages=() backups=() had_original=()
+    local stages=() backups=() had_original=() changed=() changed_names=()
     cache_bust=$(date +%s)
     urls+=("${SCRIPT_UPDATE_URL}?v=${cache_bust}")
 
@@ -7390,8 +7465,16 @@ _update_script_locked() {
         return 1
     fi
 
-    # 所有组件都验证成功后再建立回滚副本。任何一个替换失败都会恢复整组文件。
     for i in "${!targets[@]}"; do
+        if [ -x "${targets[$i]}" ] && cmp -s -- "${stages[$i]}" "${targets[$i]}"; then
+            continue
+        fi
+        changed+=("$i")
+        changed_names+=("${names[$i]}")
+    done
+
+    # 所有组件都验证成功后再备份待替换文件。任何一个替换失败都会恢复本次改动。
+    for i in "${changed[@]}"; do
         script_path=${targets[$i]}
         if [ -e "$script_path" ] || [ -L "$script_path" ]; then
             backup=$(mktemp "$(dirname "$script_path")/.${names[$i]}.rollback.XXXXXX") || {
@@ -7402,16 +7485,15 @@ _update_script_locked() {
                 rm -f -- "$backup" "${stages[@]}" "${backups[@]}"
                 return 1
             fi
-            backups+=("$backup")
-            had_original+=(1)
+            backups[$i]="$backup"
+            had_original[$i]=1
         else
-            backups+=("")
-            had_original+=(0)
+            had_original[$i]=0
         fi
     done
 
     local commit_failed=0
-    for i in "${!targets[@]}"; do
+    for i in "${changed[@]}"; do
         if ! chmod 755 "${stages[$i]}" || ! mv -f -- "${stages[$i]}" "${targets[$i]}"; then
             commit_failed=1
             break
@@ -7419,7 +7501,7 @@ _update_script_locked() {
     done
     if [ "$commit_failed" -ne 0 ]; then
         _error "脚本组提交失败，正在恢复更新前的全部组件。"
-        for j in "${!targets[@]}"; do
+        for j in "${changed[@]}"; do
             if [ "${had_original[$j]}" -eq 1 ] && [ -n "${backups[$j]}" ]; then
                 mv -f -- "${backups[$j]}" "${targets[$j]}" 2>/dev/null || true
             else
@@ -7431,11 +7513,19 @@ _update_script_locked() {
     fi
 
     rm -f -- "${stages[@]}" "${backups[@]}"
-    _success "脚本组件已作为一个事务完成更新：v${SCRIPT_VERSION} -> v${downloaded_version}"
+    if [ "${#changed[@]}" -eq 0 ]; then
+        _info "四个脚本组件内容均无变化（v${downloaded_version}）。"
+    else
+        _success "脚本组件已作为一个事务完成更新：v${SCRIPT_VERSION} -> v${downloaded_version}"
+        _info "已替换组件：${changed_names[*]}"
+    fi
+    fixed_version=$(sed -nE 's/^(export[[:space:]]+)?SINGBOX_FIXED_VERSION="([0-9]+\.[0-9]+\.[0-9]+)"[[:space:]]*$/v\2/p' "$SELF_SCRIPT_PATH" | tail -n 1)
+    _info "主脚本：${SELF_SCRIPT_PATH}"
+    _info "固定核心目标：${fixed_version:-未识别到明确版本}"
 
     # yq 是独立工具，不参与脚本文件事务；失败时明确提示，不伪报全部成功。
     if ! _install_yq; then
-        _warning "脚本已更新，但 yq 检查/更新失败，请检查网络后重试。"
+        _warning "yq 检查/更新失败，请检查网络后重试。"
     fi
 
     _info "请重新运行脚本以应用所有变更："
@@ -7459,7 +7549,7 @@ _require_singbox() {
     return 0
 }
 
-# [安装/更新 Sing-box 核心] — 最新稳定版或永久固定 v1.13.21
+# [安装/更新 Sing-box 核心] — 最新稳定版或固定版
 _install_or_update_singbox() {
     local current_ver="未安装" choice confirm
     if [ -f "${SINGBOX_BIN}" ]; then
@@ -7480,9 +7570,9 @@ _install_or_update_singbox() {
     fi
 
     if _singbox_core_is_locked; then
-        echo -e "  版本策略: ${YELLOW}固定 v${SINGBOX_FIXED_VERSION}（禁止升级）${NC}"
+        echo -e "  版本策略: ${YELLOW}固定版（目标 v${SINGBOX_FIXED_VERSION}）${NC}"
         if [ "$current_ver" != "$SINGBOX_FIXED_VERSION" ]; then
-            _warn "检测到固定锁与当前核心版本不一致，请选择 [2] 恢复固定版。"
+            _warn "当前核心与固定版目标不同，请选择 [2] 安装 v${SINGBOX_FIXED_VERSION}。"
         fi
     else
         echo -e "  版本策略: ${GREEN}跟随最新稳定版${NC}"
@@ -7496,8 +7586,8 @@ _install_or_update_singbox() {
     case "$choice" in
         1)
             if _singbox_core_is_locked; then
-                _error "当前核心已固定为 v${SINGBOX_FIXED_VERSION}，不允许升级到其他版本。"
-                _info "如需修复或重装，请选择 [2] 重新安装固定版。"
+                _error "固定版锁已启用，无法切换到跟随最新稳定版。"
+                _info "请选择 [2] 安装或重装固定版 v${SINGBOX_FIXED_VERSION}。"
                 return 1
             fi
             _do_update_singbox latest
@@ -8727,6 +8817,7 @@ _show_add_node_menu() {
     echo -e "    ${GREEN}[8]${NC} Shadowsocks"
     echo -e "    ${GREEN}[9]${NC} VLESS (TCP)"
     echo -e "    ${GREEN}[10]${NC} SOCKS5"
+    echo -e "    ${GREEN}[12]${NC} Snell v6"
     echo ""
     
     echo -e "  ${CYAN}【快捷功能】${NC}"
@@ -8737,7 +8828,7 @@ _show_add_node_menu() {
     echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
     echo ""
     
-    read -p "  请输入选项 [0-11]: " choice
+    read -p "  请输入选项 [0-12]: " choice
 
     # 如果输入包含逗号或空格，自动进入批量处理模式
     if [[ "$choice" == *","* ]] || [[ "$choice" == *" "* ]]; then
@@ -8757,6 +8848,7 @@ _show_add_node_menu() {
         9) _run_main_create_transaction _add_vless_tcp ;;
         10) _run_main_create_transaction _add_socks ;;
         11) _run_main_create_transaction _batch_create_nodes ;;
+        12) _run_main_create_transaction _add_snell_v6 ;;
         0) return ;;
         *) _error "无效输入，请重试。"; return 1 ;;
     esac
